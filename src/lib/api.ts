@@ -102,7 +102,31 @@ function isSpaShellHtml(raw: string): boolean {
   );
 }
 
+let cachedLocalOnly = false;
+
+function isStorageRoute(url: string): boolean {
+  const p = url.split('?')[0];
+  return (
+    p.startsWith('/api/projects') ||
+    p.startsWith('/api/presets') ||
+    p.startsWith('/api/styles') ||
+    p.startsWith('/api/fonts') ||
+    p.startsWith('/api/jobs') ||
+    p.startsWith('/api/settings') ||
+    p.startsWith('/api/uploads') ||
+    p.startsWith('/api/system/storage-usage') ||
+    p.startsWith('/api/system/cleanup')
+  );
+}
+
 async function request<T>(url: string, init?: RequestInit): Promise<T> {
+  if (cachedLocalOnly && isStorageRoute(url)) {
+    const localResult = await handleLocalApiFallback<T>(url, init);
+    if (localResult !== undefined) {
+      return localResult;
+    }
+  }
+
   const fullUrl = resolveApiUrl(url);
   let res: Response;
   let raw = '';
@@ -129,6 +153,7 @@ async function request<T>(url: string, init?: RequestInit): Promise<T> {
 
   if (data) {
     if (data.localOnly === true || data.storageMode === 'local-indexeddb') {
+      cachedLocalOnly = true;
       const localResult = await handleLocalApiFallback<T>(url, init);
       if (localResult !== undefined) {
         return localResult;
@@ -192,6 +217,9 @@ export const api = {
       request<SystemStatus>('/api/system/status'),
       getStoredFishApiKey(),
     ]);
+    if (res.localOnly === true || res.storageMode === 'local-indexeddb' || res.d1Available === false) {
+      cachedLocalOnly = true;
+    }
     return {
       ...res,
       fishConfigured: Boolean(res.fishConfigured || localKey),
