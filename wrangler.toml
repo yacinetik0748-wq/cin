@@ -3,6 +3,14 @@ pages_build_output_dir = "dist"
 compatibility_date = "2025-03-01"
 compatibility_flags = ["nodejs_compat"]
 
+# REQUIRED for Cloudflare Pages server-side project persistence (when BACKEND_URL is not set):
+# Create a D1 database with `npx wrangler d1 create recap-studio-db`, apply `db/d1_migrations/0001_init.sql`,
+# and bind it as `DB` in Cloudflare Pages Settings -> Functions -> D1 database bindings (or below).
+# [[d1_databases]]
+# binding = "DB"
+# database_name = "recap-studio-db"
+# database_id = "<YOUR_D1_DATABASE_ID>"
+
 # OPTIONAL Cloudflare R2 Bucket (Free Tier: 10 GB/month, requires Cloudflare R2 onboarding)
 # Uncomment below if you enable R2. Without R2, large media uses browser IndexedDB.
 # [[r2_buckets]]

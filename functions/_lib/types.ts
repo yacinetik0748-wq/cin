@@ -15,11 +15,13 @@ export interface Env {
 
 export class HttpError extends Error {
   statusCode: number;
+  code?: string;
 
-  constructor(message: string, statusCode = 500) {
+  constructor(message: string, statusCode = 500, code?: string) {
     super(message);
     this.name = 'HttpError';
     this.statusCode = statusCode;
+    this.code = code;
   }
 }
 
@@ -29,6 +31,14 @@ export function getErrorStatus(err: unknown, fallback = 500): number {
     if (Number.isFinite(code) && code >= 400 && code < 600) {
       return code;
     }
+  }
+  return fallback;
+}
+
+export function getErrorCode(err: unknown, fallback?: string): string | undefined {
+  if (err && typeof err === 'object' && 'code' in err) {
+    const c = (err as { code?: unknown }).code;
+    if (typeof c === 'string' && c.trim()) return c.trim();
   }
   return fallback;
 }

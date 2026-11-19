@@ -34,7 +34,7 @@ import {
   StudioPresetAssetRef,
   VideoCanvasConfig,
 } from '../../types/studio';
-import { api, uploadVideoChunked } from '../../lib/api';
+import { api, isValidProjectId, uploadVideoChunked } from '../../lib/api';
 import { formatBytes, formatDurationShort, formatTimecode } from '../../lib/formatters';
 import {
   createWorkflowUpdate,
@@ -214,6 +214,11 @@ export function EditToolSheet({
 
   const handleReplaceVideo = async (file: File) => {
     setErrorMsg(null);
+    setSuccessMsg(null);
+    if (!isValidProjectId(project?.id)) {
+      setErrorMsg('Cannot upload video: invalid or missing project ID. Please reopen your project from Projects.');
+      return;
+    }
     try {
       setUploadPct(2);
       const updated = await uploadVideoChunked({

@@ -21,15 +21,12 @@ import {
   SyncMode,
   SystemStatus,
   VideoMetadata,
-  DEFAULT_SUBTITLE_STYLE,
-  DEFAULT_VIDEO_EFFECTS,
-  DEFAULT_VIDEO_CANVAS,
 } from '../types/studio';
 import type { FontCatalogItem } from './fontCatalog';
 import { handleLocalApiFallback } from './localApiFallback';
 import { processVideoUploadInBrowser } from './browserVideoProcessor';
 import { idbGet, idbSet } from './browserStorage';
-import { createDefaultMainVideoClip } from './videoTimeline';
+import { indexedDbStore } from './indexedDbStore';
 import {
   getStoredFishApiKey,
   getFishAudioSettingsSummary,
@@ -78,13 +75,31 @@ export function resolveApiUrl(path: string): string {
   return API_BASE_URL ? `${API_BASE_URL}${cleanPath}` : cleanPath;
 }
 
+export function isValidProjectId(id: unknown): id is string {
+  if (typeof id !== 'string') return false;
+  const trimmed = id.trim();
+  return Boolean(trimmed && trimmed !== 'undefined' && trimmed !== 'null');
+}
+
 export class ApiHttpError extends Error {
   status: number;
-  constructor(message: string, status: number) {
+  code?: string;
+
+  constructor(message: string, status: number, code?: string) {
     super(message);
     this.name = 'ApiHttpError';
     this.status = status;
+    this.code = code;
   }
+}
+
+function isSpaShellHtml(raw: string): boolean {
+  const head = raw.trimStart().slice(0, 800).toLowerCase();
+  return (
+    head.startsWith('<!doctype html') ||
+    head.includes('<div id="root"') ||
+    head.includes('src="/src/main.tsx"')
+  );
 }
 
 async function request<T>(url: string, init?: RequestInit): Promise<T> {
@@ -115,13 +130,16 @@ async function request<T>(url: string, init?: RequestInit): Promise<T> {
   if (data) {
     if (!res.ok) {
       const errMsg = typeof data.error === 'string' ? data.error : `Request failed (${res.status})`;
-      throw new ApiHttpError(errMsg, res.status);
+      const errCode = typeof data.code === 'string' ? data.code : undefined;
+      throw new ApiHttpError(errMsg, res.status, errCode);
     }
     return data as T;
   }
 
-  // Non-JSON / HTML response (e.g., static hosting without Functions/Express backend on /api/*)
-  if (!res.ok || raw.trimStart().startsWith('<')) {
+  // Non-JSON / HTML response: only fall back to local IndexedDB when hitting static hosting
+  // without any backend (e.g., 200 SPA index.html shell or generic 404 without API error body).
+  // Never mask genuine server errors (413, 500, 502, 503, 400, etc.) as "Project not found".
+  if ((res.status === 200 && isSpaShellHtml(raw)) || res.status === 404) {
     const localResult = await handleLocalApiFallback<T>(url, init);
     if (localResult !== undefined) {
       return localResult;
@@ -129,6 +147,20 @@ async function request<T>(url: string, init?: RequestInit): Promise<T> {
   }
 
   if (!res.ok) {
+    if (res.status === 413) {
+      throw new ApiHttpError(
+        'Uploaded file exceeds the server payload limit. Try chunked upload or a smaller video.',
+        413,
+        'PAYLOAD_TOO_LARGE'
+      );
+    }
+    if (res.status === 502 || res.status === 503 || res.status === 504) {
+      throw new ApiHttpError(
+        `Backend service is unavailable (${res.status}). Check server/database configuration and try again.`,
+        res.status,
+        'SERVICE_UNAVAILABLE'
+      );
+    }
     throw new ApiHttpError(`Request failed (${res.status})`, res.status);
   }
   throw new Error('Server returned an unexpected non-JSON response. Please try again.');
@@ -595,8 +627,8 @@ export const api = {
 
   listProjects: () => request<{ projects: Project[] }>('/api/projects'),
 
-  createProject: (name: string, presetOpts?: PresetApplyOptions) =>
-    request<{
+  createProject: async (name: string, presetOpts?: PresetApplyOptions) => {
+    const res = await request<{
       project: Project;
       presetWarnings?: PresetWarning[];
       voiceMissingWarning?: StyleMissingVoiceWarning | null;
@@ -604,7 +636,13 @@ export const api = {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ name, ...(presetOpts || {}) }),
-    }),
+    });
+    if (res.project?.id) {
+      void indexedDbStore.saveProjectSnapshot(res.project);
+      void idbSet('projects', res.project.id, res.project).catch(() => undefined);
+    }
+    return res;
+  },
 
   applyPresetsToProject: (projectId: string, presetOpts: PresetApplyOptions) =>
     request<{ project: Project; presetWarnings?: PresetWarning[] }>(
@@ -616,14 +654,33 @@ export const api = {
       }
     ),
 
-  getProject: (id: string) => request<{ project: Project }>(`/api/projects/${id}`),
+  getProject: (id: string) => {
+    if (!isValidProjectId(id)) {
+      return Promise.reject(
+        new ApiHttpError('Invalid or missing project ID.', 400, 'INVALID_PROJECT_ID')
+      );
+    }
+    return request<{ project: Project }>(`/api/projects/${encodeURIComponent(id.trim())}`);
+  },
 
-  updateProject: (id: string, patch: Partial<Project>) =>
-    request<{ project: Project }>(`/api/projects/${id}`, {
-      method: 'PATCH',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(patch),
-    }),
+  updateProject: async (id: string, patch: Partial<Project>) => {
+    if (!isValidProjectId(id)) {
+      throw new ApiHttpError('Invalid or missing project ID.', 400, 'INVALID_PROJECT_ID');
+    }
+    const res = await request<{ project: Project }>(
+      `/api/projects/${encodeURIComponent(id.trim())}`,
+      {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(patch),
+      }
+    );
+    if (res.project?.id) {
+      void indexedDbStore.saveProjectSnapshot(res.project);
+      void idbSet('projects', res.project.id, res.project).catch(() => undefined);
+    }
+    return res;
+  },
 
   deleteProject: (id: string) =>
     request<{ deleted: boolean }>(`/api/projects/${id}`, { method: 'DELETE' }),
@@ -867,13 +924,31 @@ export const api = {
 
   listAllJobs: () => request<{ jobs: RenderJob[] }>('/api/jobs'),
 
-  uploadVideoDirect: (projectId: string, file: File) => {
+  uploadVideoDirect: async (projectId: string, file: File) => {
+    if (!isValidProjectId(projectId)) {
+      throw new ApiHttpError(
+        'Invalid or missing project ID. Please select or create a project before uploading.',
+        400,
+        'INVALID_PROJECT_ID'
+      );
+    }
+    const cleanId = projectId.trim();
+    // Verify project exists on backend before transmitting binary video payload
+    await api.getProject(cleanId);
     const fd = new FormData();
     fd.append('file', file);
-    return request<{ project: Project; metadata: VideoMetadata }>(`/api/projects/${projectId}/video`, {
-      method: 'POST',
-      body: fd,
-    });
+    const res = await request<{ project: Project; metadata: VideoMetadata }>(
+      `/api/projects/${encodeURIComponent(cleanId)}/video`,
+      {
+        method: 'POST',
+        body: fd,
+      }
+    );
+    if (res.project?.id) {
+      void indexedDbStore.saveProjectSnapshot(res.project);
+      void idbSet('projects', res.project.id, res.project).catch(() => undefined);
+    }
+    return res;
   },
 
   getTimelineFilmstrip: (projectId: string, frames?: number) =>
@@ -892,172 +967,149 @@ export async function uploadVideoChunked(params: {
   file: File;
   onProgress: (pct: number, stage: string) => void;
 }): Promise<Project> {
-  const { projectId, file, onProgress } = params;
+  const { file, onProgress } = params;
+  if (!isValidProjectId(params.projectId)) {
+    throw new ApiHttpError(
+      'Invalid or missing project ID. Please select or create a project first.',
+      400,
+      'INVALID_PROJECT_ID'
+    );
+  }
+  const projectId = params.projectId.trim();
 
-  try {
-    const CHUNK_SIZE = 5 * 1024 * 1024; // 5 MB chunks
-    const totalChunks = Math.max(1, Math.ceil(file.size / CHUNK_SIZE));
+  const dotIdx = file.name.lastIndexOf('.');
+  const ext = dotIdx >= 0 ? file.name.slice(dotIdx).toLowerCase() : '';
+  if (!['.mp4', '.mov', '.mkv'].includes(ext)) {
+    throw new ApiHttpError(
+      `Unsupported video format "${ext || 'unknown'}". Allowed formats: MP4, MOV, MKV.`,
+      400,
+      'UNSUPPORTED_VIDEO_FORMAT'
+    );
+  }
+  if (file.size <= 0) {
+    throw new ApiHttpError('Selected video file is empty.', 400, 'EMPTY_FILE');
+  }
 
-    onProgress(2, 'Initializing chunked upload...');
-    const initRes = await request<{ uploadId: string; totalChunks: number }>('/api/uploads/init', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        projectId,
-        filename: file.name,
-        totalSize: file.size,
-        totalChunks,
-      }),
+  // Confirm project exists in persistent storage before uploading chunks
+  onProgress(1, 'Verifying project...');
+  await api.getProject(projectId);
+
+  const CHUNK_SIZE = 5 * 1024 * 1024; // 5 MB chunks
+  const totalChunks = Math.max(1, Math.ceil(file.size / CHUNK_SIZE));
+
+  onProgress(2, 'Initializing upload...');
+  const initRes = await request<{
+    uploadId: string;
+    totalChunks: number;
+    projectId?: string;
+    storageMode?: 'r2' | 'indexeddb-local';
+    suggestedUrl?: string;
+    offlineLocal?: boolean;
+  }>('/api/uploads/init', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      projectId,
+      filename: file.name,
+      totalSize: file.size,
+      totalChunks,
+    }),
+  });
+
+  // When running on Cloudflare Pages without R2 bucket (or offline static mode),
+  // store the large video binary in browser IndexedDB and persist metadata/blob key on the D1 project.
+  if (initRes.storageMode === 'indexeddb-local') {
+    const result = await processVideoUploadInBrowser(file, onProgress, projectId);
+    const firstThumbUrl = result.filmstrip.find((f) => Boolean(f.url))?.url || null;
+    const durableIdbUrl = `idb://blobs/${result.sourceVideoBlobKey}`;
+
+    await idbSet('filmstrips', projectId, {
+      id: projectId,
+      frames: result.filmstrip,
+      duration: result.duration,
+    });
+    await idbSet('waveforms', projectId, {
+      id: projectId,
+      waveforms: result.waveforms,
     });
 
-    for (let i = 0; i < totalChunks; i++) {
-      const start = i * CHUNK_SIZE;
-      const end = Math.min(file.size, start + CHUNK_SIZE);
-      const slice = file.slice(start, end);
-      const buffer = await slice.arrayBuffer();
-
-      const chunkUrl = resolveApiUrl(`/api/uploads/${initRes.uploadId}/chunk?index=${i}`);
-      const chunkRes = await fetch(chunkUrl, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/octet-stream' },
-        body: buffer,
-      });
-      if (!chunkRes.ok) {
-        throw new Error(`Chunk ${i + 1} upload failed (${chunkRes.status})`);
-      }
-
-      const pct = Math.round(5 + ((i + 1) / totalChunks) * 80);
-      onProgress(pct, `Uploading chunk ${i + 1} of ${totalChunks}...`);
-    }
-
-    onProgress(90, 'Analyzing video streams & extracting audio waveform...');
+    onProgress(95, 'Saving video association to project...');
     const completeRes = await request<{ project: Project }>(
-      `/api/uploads/${initRes.uploadId}/complete`,
+      `/api/uploads/${encodeURIComponent(initRes.uploadId)}/complete`,
       {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ projectId }),
+        body: JSON.stringify({
+          projectId,
+          storageMode: 'indexeddb-local',
+          sourceVideoUrl: durableIdbUrl,
+          sourceVideoBlobKey: result.sourceVideoBlobKey,
+          sourceFilename: file.name,
+          thumbnailDataUrl: firstThumbUrl || undefined,
+          metadata: result.metadata,
+          waveformPeaks: result.waveforms.orig,
+        }),
       }
     );
 
+    const savedProject: Project = {
+      ...completeRes.project,
+      sourceVideoUrl: result.sourceVideoUrl || completeRes.project.sourceVideoUrl,
+      sourceVideoBlobKey: result.sourceVideoBlobKey,
+    };
+    await idbSet('projects', savedProject.id, savedProject).catch(() => undefined);
+    await indexedDbStore.saveProjectSnapshot(savedProject).catch(() => undefined);
     onProgress(100, 'Upload complete');
-    return completeRes.project;
-  } catch (err) {
-    // Fallback to local browser-side video processing via FFmpeg.wasm & IndexedDB
-    onProgress(5, 'Backend server offline. Processing video locally in browser...');
-    const result = await processVideoUploadInBrowser(file, onProgress, projectId);
-    const firstThumbUrl = result.filmstrip.find((f) => Boolean(f.url))?.url || null;
-    const defaultMainClip = createDefaultMainVideoClip({
-      filename: file.name,
-      name: file.name.replace(/\.[^/.]+$/, ''),
-      duration: result.duration || result.metadata?.duration || 12,
-      audioUnlinked: false,
-    });
+    return savedProject;
+  }
 
-    let project = await idbGet<Project>('projects', projectId);
-    if (!project) {
-      project = {
-        id: projectId,
-        name: file.name.replace(/\.[^/.]+$/, ''),
-        createdAt: new Date().toISOString(),
-        updatedAt: new Date().toISOString(),
-        sourceVideoUrl: result.sourceVideoUrl,
-        sourceVideoBlobKey: result.sourceVideoBlobKey,
-        sourceFilename: file.name,
-        thumbnailUrl: firstThumbUrl,
-        metadata: result.metadata,
-        waveformPeaks: result.waveforms.orig,
-        captions: [],
-        subtitleStyle: DEFAULT_SUBTITLE_STYLE,
-        translation: { sourceLanguage: 'English', targetLanguage: 'English', preserveProperNouns: true },
-        voice: {
-          enabled: false,
-          provider: 'fish',
-          syncMode: 'flexible',
-          targetLanguage: 'English',
-          gender: 'female',
-          voiceName: 'Puck',
-          style: 'narrative',
-          narrationStyle: 'cinematic',
-          speakingSpeed: 1.0,
-          voiceVolume: 1.0,
-          timingOffsetSec: 0,
-          preserveOriginalAudio: true,
-          originalAudioVolume: 0.3,
-          fadeInSec: 0.5,
-          fadeOutSec: 0.5,
-          bgMusicVolume: 0.2,
-          generatedClips: [],
-        },
-        blurs: [],
-        logos: [],
-        videoEffects: {
-          filterPreset: 'cinematic',
-          filterIntensity: 100,
-          filterStack: [],
-          adjustments: { brightness: 0, contrast: 0, saturation: 0, exposure: 0, temperature: 0, tint: 0, highlights: 0, shadows: 0, sharpness: 0, vignette: 0, fade: 0 },
-          effects: [],
-          compareMode: false,
-        },
-        canvas: {
-          aspectRatio: '9:16',
-          customWidth: 1080,
-          customHeight: 1920,
-          zoom: 1.0,
-          offsetX: 0,
-          offsetY: 0,
-          cropTop: 0,
-          cropRight: 0,
-          cropBottom: 0,
-          cropLeft: 0,
-          backgroundType: 'solid',
-          bgColor: '#0B0B0F',
-          bgImageScale: 1.0,
-          bgImageOffsetX: 0,
-          bgImageOffsetY: 0,
-          bgBlurIntensity: 20,
-          bgBlurBrightness: 100,
-          bgBlurOpacity: 100,
-        },
-        exportSettings: {
-          aspectRatio: '9:16',
-          resolution: '1080p',
-          fitMode: 'blur-pad',
-          format: 'mp4',
-          videoCodec: 'h264',
-          audioCodec: 'aac',
-          applyBlur: true,
-          applyLogo: true,
-          applyVideoEffects: true,
-          applyCaptions: false,
-          applyDubbing: true,
-          applyAudioMix: true,
-        },
-        lastExportUrl: null,
-        lastExportSize: null,
-        lastExportedAt: null,
-        videoClips: [defaultMainClip],
-        originalAudioClips: [],
-      };
-    } else {
-      project.sourceVideoUrl = result.sourceVideoUrl;
-      project.sourceVideoBlobKey = result.sourceVideoBlobKey;
-      project.sourceFilename = file.name;
-      if (!project.thumbnailUrl && firstThumbUrl) {
-        project.thumbnailUrl = firstThumbUrl;
+  for (let i = 0; i < totalChunks; i++) {
+    const start = i * CHUNK_SIZE;
+    const end = Math.min(file.size, start + CHUNK_SIZE);
+    const slice = file.slice(start, end);
+    const buffer = await slice.arrayBuffer();
+
+    const chunkUrl = resolveApiUrl(
+      `/api/uploads/${encodeURIComponent(initRes.uploadId)}/chunk?index=${i}`
+    );
+    const chunkRes = await fetch(chunkUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/octet-stream' },
+      body: buffer,
+    });
+    if (!chunkRes.ok) {
+      let chunkErrMsg = `Chunk ${i + 1} of ${totalChunks} upload failed (${chunkRes.status})`;
+      let chunkErrCode: string | undefined;
+      try {
+        const errJson = (await chunkRes.json()) as { error?: string; code?: string };
+        if (typeof errJson?.error === 'string' && errJson.error.trim()) {
+          chunkErrMsg = errJson.error;
+        }
+        if (typeof errJson?.code === 'string') {
+          chunkErrCode = errJson.code;
+        }
+      } catch {
+        // ignore non-JSON chunk response body
       }
-      project.metadata = result.metadata;
-      project.waveformPeaks = result.waveforms.orig;
-      if (!Array.isArray(project.videoClips) || project.videoClips.length === 0) {
-        project.videoClips = [defaultMainClip];
-      }
-      project.updatedAt = new Date().toISOString();
+      throw new ApiHttpError(chunkErrMsg, chunkRes.status, chunkErrCode);
     }
 
-    await idbSet('projects', project.id, project);
-    await idbSet('filmstrips', project.id, { id: project.id, frames: result.filmstrip, duration: result.duration });
-    await idbSet('waveforms', project.id, { id: project.id, waveforms: result.waveforms });
-    onProgress(100, 'Local browser processing complete');
-    return project;
+    const pct = Math.round(5 + ((i + 1) / totalChunks) * 80);
+    onProgress(pct, `Uploading chunk ${i + 1} of ${totalChunks}...`);
   }
+
+  onProgress(90, 'Analyzing video streams & extracting audio waveform...');
+  const completeRes = await request<{ project: Project }>(
+    `/api/uploads/${encodeURIComponent(initRes.uploadId)}/complete`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ projectId }),
+    }
+  );
+
+  await idbSet('projects', completeRes.project.id, completeRes.project).catch(() => undefined);
+  await indexedDbStore.saveProjectSnapshot(completeRes.project).catch(() => undefined);
+  onProgress(100, 'Upload complete');
+  return completeRes.project;
 }

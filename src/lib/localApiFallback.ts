@@ -313,9 +313,54 @@ export async function handleLocalApiFallback<T>(url: string, init?: RequestInit)
     } as unknown as T;
   }
 
+  // Offline upload init/complete fallback when static-only / no backend exists
+  if (pathname === '/api/uploads/init' && method === 'POST') {
+    const body = init?.body ? JSON.parse(String(init.body)) : {};
+    const projId = typeof body.projectId === 'string' ? body.projectId.trim() : '';
+    if (!projId || projId === 'undefined' || projId === 'null') {
+      throw new Error('Invalid or missing projectId.');
+    }
+    const proj = await idbGet<Project>('projects', projId);
+    if (!proj) throw new Error('Project not found');
+    const totalChunks = Math.max(1, Number(body.totalChunks) || 1);
+    return {
+      uploadId: `offline_${crypto.randomUUID()}`,
+      totalChunks,
+      projectId: proj.id,
+      storageMode: 'indexeddb-local',
+      offlineLocal: true,
+    } as unknown as T;
+  }
+
+  const offlineUploadCompleteMatch = /^\/api\/uploads\/([^/]+)\/complete$/.exec(pathname);
+  if (offlineUploadCompleteMatch && method === 'POST') {
+    const body = init?.body ? JSON.parse(String(init.body)) : {};
+    const projId = typeof body.projectId === 'string' ? body.projectId.trim() : '';
+    if (!projId || projId === 'undefined' || projId === 'null') {
+      throw new Error('Invalid or missing projectId.');
+    }
+    const proj = await idbGet<Project>('projects', projId);
+    if (!proj) throw new Error('Project not found');
+    const updated: Project = {
+      ...proj,
+      ...(body.sourceVideoUrl ? { sourceVideoUrl: body.sourceVideoUrl } : {}),
+      ...(body.sourceVideoBlobKey ? { sourceVideoBlobKey: body.sourceVideoBlobKey } : {}),
+      ...(body.sourceFilename ? { sourceFilename: body.sourceFilename } : {}),
+      ...(body.thumbnailDataUrl && !proj.thumbnailUrl ? { thumbnailUrl: body.thumbnailDataUrl } : {}),
+      ...(body.metadata ? { metadata: body.metadata } : {}),
+      ...(Array.isArray(body.waveformPeaks) ? { waveformPeaks: body.waveformPeaks } : {}),
+      updatedAt: new Date().toISOString(),
+    };
+    await idbSet('projects', projId, updated);
+    return { project: updated, metadata: updated.metadata } as unknown as T;
+  }
+
   const projMatch = /^\/api\/projects\/([^/]+)$/.exec(pathname);
   if (projMatch) {
-    const projId = projMatch[1];
+    const projId = decodeURIComponent(projMatch[1] || '').trim();
+    if (!projId || projId === 'undefined' || projId === 'null') {
+      throw new Error('Invalid or missing projectId.');
+    }
     if (method === 'GET') {
       const proj = await idbGet<Project>('projects', projId);
       if (!proj) throw new Error('Project not found');

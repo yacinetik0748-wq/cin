@@ -67,7 +67,9 @@ import {
   generateVideoThumbnail,
 } from './server/services/video_analysis_service.ts';
 import {
+  UploadValidationError,
   finalizeChunkedUpload,
+  getChunkSession,
   getMaxUploadBytes,
   initChunkedUpload,
   saveCanvasBackgroundFile,
@@ -174,10 +176,19 @@ app.use((req, res, next) => {
 app.use(express.json({ limit: '25mb' }));
 app.use(express.raw({ type: 'application/octet-stream', limit: '30mb' }));
 
+const DIRECT_UPLOAD_MAX_BYTES = Math.min(getMaxUploadBytes(), 150 * 1024 * 1024);
+
 const uploadMem = multer({
   storage: multer.memoryStorage(),
-  limits: { fileSize: 55 * 1024 * 1024 },
+  limits: { fileSize: DIRECT_UPLOAD_MAX_BYTES },
 });
+
+function normalizeProjectId(raw: unknown): string | null {
+  if (typeof raw !== 'string') return null;
+  const trimmed = raw.trim();
+  if (!trimmed || trimmed === 'undefined' || trimmed === 'null') return null;
+  return trimmed;
+}
 
 // Serve nested filmstrip thumbnail frames (/media/thumbs/<filmstrip_dir>/<frame_NNN.jpg>)
 app.get('/media/thumbs/:subdir/:filename', (req, res) => {
@@ -1527,27 +1538,44 @@ app.post('/api/projects/:id/sample-video', async (req, res) => {
 // Chunked Video Upload Flow
 app.post('/api/uploads/init', (req, res) => {
   try {
-    const { projectId, filename, totalSize, totalChunks } = req.body || {};
-    if (!projectId || !filename || !totalSize || !totalChunks) {
-      res.status(400).json({ error: 'Missing required chunk initialization parameters.' });
+    const { projectId: rawProjectId, filename, totalSize, totalChunks } = req.body || {};
+    const projectId = normalizeProjectId(rawProjectId);
+    if (!projectId) {
+      res.status(400).json({ error: 'Invalid or missing projectId.', code: 'INVALID_PROJECT_ID' });
       return;
     }
-    const project = getProject(projectId);
+    if (!filename || !totalSize || !totalChunks) {
+      res.status(400).json({ error: 'Missing required chunk initialization parameters.', code: 'INVALID_PARAMS' });
+      return;
+    }
+
+    let project: Project | null = null;
+    try {
+      project = getProject(projectId);
+    } catch (dbErr) {
+      res.status(500).json({
+        error: `Database lookup failed: ${dbErr instanceof Error ? dbErr.message : String(dbErr)}`,
+        code: 'DATABASE_ERROR',
+      });
+      return;
+    }
     if (!project) {
-      res.status(404).json({ error: 'Project not found.' });
+      res.status(404).json({ error: 'Project not found.', code: 'PROJECT_NOT_FOUND' });
       return;
     }
 
     const session = initChunkedUpload({
-      projectId,
-      filename,
+      projectId: project.id,
+      filename: String(filename),
       totalSize: Number(totalSize),
       totalChunks: Number(totalChunks),
     });
 
-    res.json({ uploadId: session.uploadId, totalChunks: session.totalChunks });
+    res.json({ uploadId: session.uploadId, totalChunks: session.totalChunks, projectId: project.id });
   } catch (err) {
-    res.status(400).json({ error: err instanceof Error ? err.message : String(err) });
+    const status = err instanceof UploadValidationError ? err.statusCode : 400;
+    const code = err instanceof UploadValidationError ? err.code : 'UPLOAD_INIT_FAILED';
+    res.status(status).json({ error: err instanceof Error ? err.message : String(err), code });
   }
 });
 
@@ -1555,19 +1583,58 @@ app.post('/api/uploads/:uploadId/chunk', (req, res) => {
   try {
     const chunkIndex = Number(req.query.index);
     if (!Buffer.isBuffer(req.body)) {
-      res.status(400).json({ error: 'Expected binary application/octet-stream chunk payload.' });
+      res.status(400).json({
+        error: 'Expected binary application/octet-stream chunk payload.',
+        code: 'INVALID_CHUNK_PAYLOAD',
+      });
       return;
     }
     const progress = saveUploadChunk(req.params.uploadId, chunkIndex, req.body);
     res.json(progress);
   } catch (err) {
-    res.status(400).json({ error: err instanceof Error ? err.message : String(err) });
+    const status = err instanceof UploadValidationError ? err.statusCode : 400;
+    const code = err instanceof UploadValidationError ? err.code : 'CHUNK_UPLOAD_FAILED';
+    res.status(status).json({ error: err instanceof Error ? err.message : String(err), code });
   }
 });
 
 app.post('/api/uploads/:uploadId/complete', async (req, res) => {
   try {
-    const projectId = String(req.body?.projectId || '');
+    const session = getChunkSession(req.params.uploadId);
+    if (!session) {
+      res.status(404).json({ error: 'Upload session not found.', code: 'UPLOAD_SESSION_NOT_FOUND' });
+      return;
+    }
+
+    const requestedProjectId = normalizeProjectId(req.body?.projectId);
+    const projectId = requestedProjectId || session.projectId;
+    if (!projectId) {
+      res.status(400).json({ error: 'Invalid or missing projectId.', code: 'INVALID_PROJECT_ID' });
+      return;
+    }
+    if (session.projectId !== projectId) {
+      res.status(400).json({
+        error: 'Upload session does not belong to the specified project.',
+        code: 'PROJECT_ID_MISMATCH',
+      });
+      return;
+    }
+
+    let existingProj: Project | null = null;
+    try {
+      existingProj = getProject(projectId);
+    } catch (dbErr) {
+      res.status(500).json({
+        error: `Database lookup failed: ${dbErr instanceof Error ? dbErr.message : String(dbErr)}`,
+        code: 'DATABASE_ERROR',
+      });
+      return;
+    }
+    if (!existingProj) {
+      res.status(404).json({ error: 'Project not found.', code: 'PROJECT_NOT_FOUND' });
+      return;
+    }
+
     const uploaded = await finalizeChunkedUpload(req.params.uploadId);
     const metadata = await analyzeVideoFile(uploaded.filePath);
     const thumbnailUrl = await generateVideoThumbnail(
@@ -1577,8 +1644,6 @@ app.post('/api/uploads/:uploadId/complete', async (req, res) => {
     );
     const waveformPeaks = await extractWaveformPeaks(uploaded.filePath, metadata.hasAudio);
 
-    const existingProj = getProject(projectId);
-
     const updated = updateProject(projectId, {
       sourceVideoUrl: uploaded.url,
       sourceFilename: uploaded.filename,
@@ -1597,44 +1662,61 @@ app.post('/api/uploads/:uploadId/complete', async (req, res) => {
         },
       ],
       originalAudioClips: [],
-      exportSettings: existingProj
-        ? { ...existingProj.exportSettings, aspectRatio: existingProj.exportSettings.aspectRatio || 'original' }
-        : undefined,
+      exportSettings: {
+        ...existingProj.exportSettings,
+        aspectRatio: existingProj.exportSettings.aspectRatio || 'original',
+      },
     });
     if (!updated) {
-      res.status(404).json({ error: 'Project not found' });
+      res.status(404).json({ error: 'Project not found.', code: 'PROJECT_NOT_FOUND' });
       return;
     }
 
     res.json({ project: updated, metadata });
   } catch (err) {
-    res.status(400).json({ error: err instanceof Error ? err.message : String(err) });
+    const status = err instanceof UploadValidationError ? err.statusCode : 400;
+    const code = err instanceof UploadValidationError ? err.code : 'UPLOAD_FINALIZE_FAILED';
+    res.status(status).json({ error: err instanceof Error ? err.message : String(err), code });
   }
 });
 
 // Direct Video Upload (Single-request multipart upload with Multer)
 app.post('/api/projects/:id/video', uploadMem.single('file'), async (req, res) => {
   try {
-    const projectId = req.params.id;
-    const project = getProject(projectId);
+    const projectId = normalizeProjectId(req.params.id);
+    if (!projectId) {
+      res.status(400).json({ error: 'Invalid or missing projectId.', code: 'INVALID_PROJECT_ID' });
+      return;
+    }
+
+    let project: Project | null = null;
+    try {
+      project = getProject(projectId);
+    } catch (dbErr) {
+      res.status(500).json({
+        error: `Database lookup failed: ${dbErr instanceof Error ? dbErr.message : String(dbErr)}`,
+        code: 'DATABASE_ERROR',
+      });
+      return;
+    }
     if (!project) {
-      res.status(404).json({ error: 'Project not found.' });
+      res.status(404).json({ error: 'Project not found.', code: 'PROJECT_NOT_FOUND' });
       return;
     }
     if (!req.file) {
-      res.status(400).json({ error: 'No video file provided.' });
+      res.status(400).json({ error: 'No video file provided.', code: 'NO_FILE_PROVIDED' });
       return;
     }
-    const uploaded = saveDirectVideoFile(projectId, req.file.originalname, req.file.buffer);
+    const uploaded = saveDirectVideoFile(project.id, req.file.originalname, req.file.buffer);
     const metadata = await analyzeVideoFile(uploaded.filePath);
     const thumbnailUrl = await generateVideoThumbnail(
       uploaded.filePath,
-      projectId,
+      project.id,
       Math.min(2, Math.max(0.2, metadata.duration * 0.15))
     );
     const waveformPeaks = await extractWaveformPeaks(uploaded.filePath, metadata.hasAudio);
 
-    const updated = updateProject(projectId, {
+    const updated = updateProject(project.id, {
       sourceVideoUrl: uploaded.url,
       sourceFilename: uploaded.filename,
       thumbnailUrl,
@@ -1657,39 +1739,55 @@ app.post('/api/projects/:id/video', uploadMem.single('file'), async (req, res) =
         aspectRatio: project.exportSettings.aspectRatio || 'original',
       },
     });
+    if (!updated) {
+      res.status(404).json({ error: 'Project not found.', code: 'PROJECT_NOT_FOUND' });
+      return;
+    }
 
     res.json({ project: updated, metadata });
   } catch (err) {
-    res.status(400).json({ error: err instanceof Error ? err.message : String(err) });
+    const status = err instanceof UploadValidationError ? err.statusCode : 400;
+    const code = err instanceof UploadValidationError ? err.code : 'DIRECT_UPLOAD_FAILED';
+    res.status(status).json({ error: err instanceof Error ? err.message : String(err), code });
   }
 });
 
 app.post('/api/upload', uploadMem.single('file'), async (req, res) => {
   try {
-    const projectId = String(req.body?.projectId || req.query?.projectId || '');
+    const projectId = normalizeProjectId(req.body?.projectId || req.query?.projectId);
     if (!projectId) {
-      res.status(400).json({ error: 'Missing projectId.' });
+      res.status(400).json({ error: 'Invalid or missing projectId.', code: 'INVALID_PROJECT_ID' });
       return;
     }
-    const project = getProject(projectId);
+
+    let project: Project | null = null;
+    try {
+      project = getProject(projectId);
+    } catch (dbErr) {
+      res.status(500).json({
+        error: `Database lookup failed: ${dbErr instanceof Error ? dbErr.message : String(dbErr)}`,
+        code: 'DATABASE_ERROR',
+      });
+      return;
+    }
     if (!project) {
-      res.status(404).json({ error: 'Project not found.' });
+      res.status(404).json({ error: 'Project not found.', code: 'PROJECT_NOT_FOUND' });
       return;
     }
     if (!req.file) {
-      res.status(400).json({ error: 'No video file provided.' });
+      res.status(400).json({ error: 'No video file provided.', code: 'NO_FILE_PROVIDED' });
       return;
     }
-    const uploaded = saveDirectVideoFile(projectId, req.file.originalname, req.file.buffer);
+    const uploaded = saveDirectVideoFile(project.id, req.file.originalname, req.file.buffer);
     const metadata = await analyzeVideoFile(uploaded.filePath);
     const thumbnailUrl = await generateVideoThumbnail(
       uploaded.filePath,
-      projectId,
+      project.id,
       Math.min(2, Math.max(0.2, metadata.duration * 0.15))
     );
     const waveformPeaks = await extractWaveformPeaks(uploaded.filePath, metadata.hasAudio);
 
-    const updated = updateProject(projectId, {
+    const updated = updateProject(project.id, {
       sourceVideoUrl: uploaded.url,
       sourceFilename: uploaded.filename,
       thumbnailUrl,
@@ -1712,10 +1810,16 @@ app.post('/api/upload', uploadMem.single('file'), async (req, res) => {
         aspectRatio: project.exportSettings.aspectRatio || 'original',
       },
     });
+    if (!updated) {
+      res.status(404).json({ error: 'Project not found.', code: 'PROJECT_NOT_FOUND' });
+      return;
+    }
 
     res.json({ project: updated, metadata });
   } catch (err) {
-    res.status(400).json({ error: err instanceof Error ? err.message : String(err) });
+    const status = err instanceof UploadValidationError ? err.statusCode : 400;
+    const code = err instanceof UploadValidationError ? err.code : 'DIRECT_UPLOAD_FAILED';
+    res.status(status).json({ error: err instanceof Error ? err.message : String(err), code });
   }
 });
 
@@ -2797,7 +2901,53 @@ async function startServer() {
   const isProd = process.env.NODE_ENV === 'production';
 
   app.use(['/api', '/media', '/storage'], (req, res) => {
-    res.status(404).json({ error: `Endpoint not found: ${req.originalUrl}` });
+    res.status(404).json({ error: `Endpoint not found: ${req.originalUrl}`, code: 'ENDPOINT_NOT_FOUND' });
+  });
+
+  // Always return structured JSON errors for API / upload errors (Multer, JSON syntax, payload limits, etc.)
+  app.use((err: unknown, req: express.Request, res: express.Response, next: express.NextFunction) => {
+    if (res.headersSent) {
+      next(err);
+      return;
+    }
+    if (err instanceof multer.MulterError) {
+      if (err.code === 'LIMIT_FILE_SIZE') {
+        const limitMb = Math.round(DIRECT_UPLOAD_MAX_BYTES / (1024 * 1024));
+        res.status(413).json({
+          error: `File exceeds direct upload limit (${limitMb} MB). Use chunked upload for larger videos up to ${Math.round(getMaxUploadBytes() / (1024 * 1024))} MB.`,
+          code: 'LIMIT_FILE_SIZE',
+        });
+        return;
+      }
+      res.status(400).json({ error: err.message || 'Multipart upload failed.', code: err.code || 'MULTER_ERROR' });
+      return;
+    }
+    const errObj = err as { status?: number; statusCode?: number; type?: string; message?: string; code?: string } | null;
+    if (errObj?.type === 'entity.too.large') {
+      res.status(413).json({
+        error: 'Request payload exceeds server body size limit.',
+        code: 'PAYLOAD_TOO_LARGE',
+      });
+      return;
+    }
+    if (err instanceof SyntaxError && errObj?.status === 400) {
+      res.status(400).json({ error: 'Malformed JSON request body.', code: 'INVALID_JSON' });
+      return;
+    }
+    const status =
+      typeof errObj?.statusCode === 'number' && errObj.statusCode >= 400
+        ? errObj.statusCode
+        : typeof errObj?.status === 'number' && errObj.status >= 400
+        ? errObj.status
+        : 500;
+    if (req.path.startsWith('/api') || req.path.startsWith('/media') || req.path.startsWith('/storage')) {
+      res.status(status).json({
+        error: errObj?.message || 'Internal server error.',
+        code: errObj?.code || 'INTERNAL_ERROR',
+      });
+      return;
+    }
+    res.status(status).json({ error: errObj?.message || 'Unexpected error.' });
   });
 
   if (!isProd) {

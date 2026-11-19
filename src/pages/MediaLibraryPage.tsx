@@ -26,6 +26,8 @@ import {
 } from '../types/studio';
 import {
   api,
+  ApiHttpError,
+  isValidProjectId,
   LocalAssetManifestItem,
   resolveApiUrl,
   uploadVideoChunked,
@@ -117,9 +119,17 @@ export function MediaLibraryPage({
     }
   };
 
+  const [missingProjectError, setMissingProjectError] = useState(false);
+
   const handleReplaceVideo = async (file: File) => {
     setErrorMsg(null);
     setStatusMsg(null);
+    setMissingProjectError(false);
+    if (!isValidProjectId(project?.id)) {
+      setMissingProjectError(true);
+      setErrorMsg('Cannot upload video: no valid project is selected.');
+      return;
+    }
     setBusyAction('replace-video');
     try {
       const updated = await uploadVideoChunked({
@@ -132,6 +142,9 @@ export function MediaLibraryPage({
       onNotice?.('Source video replaced.');
       await loadManifest();
     } catch (err) {
+      if (err instanceof ApiHttpError && (err.status === 404 || err.code === 'PROJECT_NOT_FOUND')) {
+        setMissingProjectError(true);
+      }
       setErrorMsg(err instanceof Error ? err.message : String(err));
     } finally {
       setUploadProgress(null);
@@ -338,7 +351,22 @@ export function MediaLibraryPage({
         </StudioCard>
       )}
 
-      {errorMsg && <StudioBanner tone="error">{errorMsg}</StudioBanner>}
+      {errorMsg && (
+        <StudioBanner tone="error">
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+            <span>{errorMsg}</span>
+            {missingProjectError && (
+              <StudioButton
+                size="sm"
+                variant="secondary"
+                onClick={() => onNavigate('dashboard')}
+              >
+                Go to Projects &amp; Import
+              </StudioButton>
+            )}
+          </div>
+        </StudioBanner>
+      )}
       {statusMsg && <StudioBanner tone="success">{statusMsg}</StudioBanner>}
 
       {/* Category Filter */}

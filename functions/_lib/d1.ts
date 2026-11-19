@@ -447,15 +447,13 @@ class InMemoryD1Database {
   }
 }
 
-const GLOBAL_D1_KEY = '__recapStudioInMemoryD1';
-
 export function requireDb(env: Env): D1Database {
   if (env.DB) return env.DB;
-  const g = globalThis as unknown as Record<string, InMemoryD1Database | undefined>;
-  if (!g[GLOBAL_D1_KEY]) {
-    g[GLOBAL_D1_KEY] = new InMemoryD1Database();
-  }
-  return g[GLOBAL_D1_KEY] as unknown as D1Database;
+  throw new HttpError(
+    'Cloudflare D1 database binding "DB" is not configured. Attach a D1 database binding named "DB" in Cloudflare Pages settings (or set BACKEND_URL) for persistent project storage.',
+    503,
+    'DATABASE_NOT_CONFIGURED'
+  );
 }
 
 export async function ensureSchema(db: D1Database): Promise<void> {
@@ -473,6 +471,7 @@ export async function ensureSchema(db: D1Database): Promise<void> {
     "ALTER TABLE projects ADD COLUMN video_clips_json TEXT NOT NULL DEFAULT '[]'",
     "ALTER TABLE projects ADD COLUMN original_audio_clips_json TEXT NOT NULL DEFAULT '[]'",
     'ALTER TABLE projects ADD COLUMN subtitle_removal_json TEXT',
+    'ALTER TABLE upload_sessions ADD COLUMN project_id TEXT',
   ];
   for (const stmt of addCols) {
     try {
@@ -555,6 +554,7 @@ function rowToProject(row: ProjectRow): Project {
         cloudSync?: Project['cloudSync'];
         cloudAssets?: Project['cloudAssets'];
         savedThumbnails?: Project['savedThumbnails'];
+        sourceVideoBlobKey?: string | null;
       })
     : {};
 
@@ -562,6 +562,7 @@ function rowToProject(row: ProjectRow): Project {
     id: row.id,
     name: row.name,
     sourceVideoUrl: row.source_video_url,
+    sourceVideoBlobKey: parsedCloudMeta.sourceVideoBlobKey ?? null,
     sourceFilename: row.source_filename,
     thumbnailUrl: row.thumbnail_url,
     savedThumbnails: parsedCloudMeta.savedThumbnails || [],
@@ -695,8 +696,10 @@ export async function listProjects(db: D1Database): Promise<Project[]> {
 }
 
 export async function getProject(db: D1Database, id: string): Promise<Project | null> {
+  const cleanId = typeof id === 'string' ? id.trim() : '';
+  if (!cleanId || cleanId === 'undefined' || cleanId === 'null') return null;
   await ensureSchema(db);
-  const row = await db.prepare('SELECT * FROM projects WHERE id = ?').bind(id).first<ProjectRow>();
+  const row = await db.prepare('SELECT * FROM projects WHERE id = ?').bind(cleanId).first<ProjectRow>();
   return row ? rowToProject(row) : null;
 }
 
@@ -825,6 +828,7 @@ export async function updateProject(
         cloudSync: merged.cloudSync,
         cloudAssets: merged.cloudAssets,
         savedThumbnails: merged.savedThumbnails || [],
+        sourceVideoBlobKey: merged.sourceVideoBlobKey ?? null,
       }),
       JSON.stringify(merged.exportSettings),
       merged.lastExportUrl ?? null,
@@ -897,6 +901,7 @@ export async function upsertProjectFromCloud(
           cloudSync: cloudProject.cloudSync || { syncStatus: 'cloud-synced' },
           cloudAssets: cloudProject.cloudAssets || {},
           savedThumbnails: cloudProject.savedThumbnails || [],
+          sourceVideoBlobKey: cloudProject.sourceVideoBlobKey ?? null,
         }),
         JSON.stringify({ ...DEFAULT_EXPORT_SETTINGS, ...(cloudProject.exportSettings || {}) }),
         cloudProject.lastExportUrl ?? null,

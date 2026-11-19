@@ -18,6 +18,18 @@ const ALLOWED_BG_EXTS = new Set(['.png', '.jpg', '.jpeg', '.webp']);
 const ALLOWED_FONT_EXTS = new Set(['.ttf', '.otf', '.woff', '.woff2']);
 const ALLOWED_AUDIO_EXTS = new Set(['.mp3', '.wav', '.aac', '.m4a', '.ogg']);
 
+export class UploadValidationError extends Error {
+  statusCode: number;
+  code: string;
+
+  constructor(message: string, statusCode = 400, code = 'UPLOAD_ERROR') {
+    super(message);
+    this.name = 'UploadValidationError';
+    this.statusCode = statusCode;
+    this.code = code;
+  }
+}
+
 interface ChunkSession {
   uploadId: string;
   projectId: string;
@@ -29,7 +41,76 @@ interface ChunkSession {
   createdAt: number;
 }
 
+interface PersistedChunkSessionMeta {
+  uploadId: string;
+  projectId: string;
+  filename: string;
+  totalSize: number;
+  totalChunks: number;
+  receivedChunks: number[];
+  createdAt: number;
+}
+
 const chunkSessions = new Map<string, ChunkSession>();
+
+function writeSessionMeta(session: ChunkSession): void {
+  try {
+    const metaPath = path.join(session.tempDir, 'session.json');
+    const payload: PersistedChunkSessionMeta = {
+      uploadId: session.uploadId,
+      projectId: session.projectId,
+      filename: session.filename,
+      totalSize: session.totalSize,
+      totalChunks: session.totalChunks,
+      receivedChunks: Array.from(session.receivedChunks).sort((a, b) => a - b),
+      createdAt: session.createdAt,
+    };
+    fs.writeFileSync(metaPath, JSON.stringify(payload), 'utf8');
+  } catch {
+    // Non-fatal; disk chunks still remain under CHUNKS_DIR/<uploadId>
+  }
+}
+
+function loadSessionFromDisk(uploadId: string): ChunkSession | null {
+  const safeId = path.basename(uploadId || '');
+  if (!safeId || safeId !== uploadId) return null;
+  const tempDir = path.join(CHUNKS_DIR, safeId);
+  const metaPath = path.join(tempDir, 'session.json');
+  if (!fs.existsSync(metaPath)) return null;
+  try {
+    const parsed = JSON.parse(fs.readFileSync(metaPath, 'utf8')) as PersistedChunkSessionMeta;
+    const received = new Set<number>(
+      Array.isArray(parsed.receivedChunks) ? parsed.receivedChunks : []
+    );
+    // Reconcile with chunk files present on disk
+    for (let i = 0; i < parsed.totalChunks; i++) {
+      const chunkPath = path.join(tempDir, `chunk_${String(i).padStart(6, '0')}`);
+      if (fs.existsSync(chunkPath)) {
+        received.add(i);
+      }
+    }
+    const restored: ChunkSession = {
+      uploadId: parsed.uploadId || safeId,
+      projectId: parsed.projectId,
+      filename: parsed.filename,
+      totalSize: parsed.totalSize,
+      totalChunks: parsed.totalChunks,
+      receivedChunks: received,
+      tempDir,
+      createdAt: parsed.createdAt || Date.now(),
+    };
+    chunkSessions.set(restored.uploadId, restored);
+    return restored;
+  } catch {
+    return null;
+  }
+}
+
+export function getChunkSession(uploadId: string): ChunkSession | null {
+  const cached = chunkSessions.get(uploadId);
+  if (cached) return cached;
+  return loadSessionFromDisk(uploadId);
+}
 
 export function getMaxUploadBytes(): number {
   const mb = Number(process.env.MAX_UPLOAD_SIZE_MB || '2048');
@@ -37,14 +118,23 @@ export function getMaxUploadBytes(): number {
 }
 
 export function validateVideoUpload(filename: string, sizeBytes: number) {
-  const ext = path.extname(filename).toLowerCase();
+  const ext = path.extname(filename || '').toLowerCase();
   if (!ALLOWED_VIDEO_EXTS.has(ext)) {
-    throw new Error(`Unsupported video format "${ext}". Allowed formats: MP4, MOV, MKV.`);
+    throw new UploadValidationError(
+      `Unsupported video format "${ext || 'unknown'}". Allowed formats: MP4, MOV, MKV.`,
+      400,
+      'UNSUPPORTED_VIDEO_FORMAT'
+    );
   }
   const maxBytes = getMaxUploadBytes();
+  if (!Number.isFinite(sizeBytes) || sizeBytes <= 0) {
+    throw new UploadValidationError('Video file cannot be empty.', 400, 'EMPTY_FILE');
+  }
   if (sizeBytes > maxBytes) {
-    throw new Error(
-      `File exceeds maximum allowed size (${Math.round(maxBytes / (1024 * 1024))} MB).`
+    throw new UploadValidationError(
+      `File exceeds maximum allowed size (${Math.round(maxBytes / (1024 * 1024))} MB).`,
+      413,
+      'FILE_TOO_LARGE'
     );
   }
 }
@@ -55,6 +145,13 @@ export function initChunkedUpload(params: {
   totalSize: number;
   totalChunks: number;
 }): ChunkSession {
+  const projectId = String(params.projectId || '').trim();
+  if (!projectId || projectId === 'undefined' || projectId === 'null') {
+    throw new UploadValidationError('Invalid or missing projectId.', 400, 'INVALID_PROJECT_ID');
+  }
+  if (!Number.isFinite(params.totalChunks) || params.totalChunks < 1) {
+    throw new UploadValidationError('Invalid totalChunks count.', 400, 'INVALID_CHUNK_COUNT');
+  }
   validateVideoUpload(params.filename, params.totalSize);
   const uploadId = uuidv4();
   const tempDir = path.join(CHUNKS_DIR, uploadId);
@@ -62,7 +159,7 @@ export function initChunkedUpload(params: {
 
   const session: ChunkSession = {
     uploadId,
-    projectId: params.projectId,
+    projectId,
     filename: sanitizeFilename(params.filename),
     totalSize: params.totalSize,
     totalChunks: params.totalChunks,
@@ -72,20 +169,27 @@ export function initChunkedUpload(params: {
   };
 
   chunkSessions.set(uploadId, session);
+  writeSessionMeta(session);
   return session;
 }
 
 export function saveUploadChunk(uploadId: string, chunkIndex: number, buffer: Buffer) {
-  const session = chunkSessions.get(uploadId);
+  const session = getChunkSession(uploadId);
   if (!session) {
-    throw new Error('Upload session expired or not found.');
+    throw new UploadValidationError(
+      'Upload session expired or not found.',
+      404,
+      'UPLOAD_SESSION_NOT_FOUND'
+    );
   }
-  if (chunkIndex < 0 || chunkIndex >= session.totalChunks) {
-    throw new Error(`Invalid chunk index ${chunkIndex}.`);
+  if (!Number.isInteger(chunkIndex) || chunkIndex < 0 || chunkIndex >= session.totalChunks) {
+    throw new UploadValidationError(`Invalid chunk index ${chunkIndex}.`, 400, 'INVALID_CHUNK_INDEX');
   }
+  fs.mkdirSync(session.tempDir, { recursive: true });
   const chunkPath = path.join(session.tempDir, `chunk_${String(chunkIndex).padStart(6, '0')}`);
   fs.writeFileSync(chunkPath, buffer);
   session.receivedChunks.add(chunkIndex);
+  writeSessionMeta(session);
   return {
     received: session.receivedChunks.size,
     totalChunks: session.totalChunks,
@@ -97,14 +201,21 @@ export async function finalizeChunkedUpload(uploadId: string): Promise<{
   filename: string;
   url: string;
   sizeBytes: number;
+  projectId: string;
 }> {
-  const session = chunkSessions.get(uploadId);
+  const session = getChunkSession(uploadId);
   if (!session) {
-    throw new Error('Upload session not found.');
+    throw new UploadValidationError(
+      'Upload session not found.',
+      404,
+      'UPLOAD_SESSION_NOT_FOUND'
+    );
   }
   if (session.receivedChunks.size !== session.totalChunks) {
-    throw new Error(
-      `Incomplete upload: received ${session.receivedChunks.size} of ${session.totalChunks} chunks.`
+    throw new UploadValidationError(
+      `Incomplete upload: received ${session.receivedChunks.size} of ${session.totalChunks} chunks.`,
+      400,
+      'INCOMPLETE_UPLOAD'
     );
   }
 
@@ -147,6 +258,7 @@ export async function finalizeChunkedUpload(uploadId: string): Promise<{
     filename: session.filename,
     url,
     sizeBytes: stat.size,
+    projectId: session.projectId,
   };
 }
 

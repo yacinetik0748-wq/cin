@@ -94,7 +94,46 @@ import {
   readBinaryAssetBytes,
   saveBinaryAsset,
 } from '../_lib/storage.ts';
-import { Env, HttpError, getErrorStatus } from '../_lib/types.ts';
+import { Env, HttpError, getErrorCode, getErrorStatus } from '../_lib/types.ts';
+
+const ALLOWED_VIDEO_EXTS_EDGE = new Set(['.mp4', '.mov', '.mkv']);
+
+function normalizeProjectIdEdge(raw: unknown): string | null {
+  if (typeof raw !== 'string') return null;
+  const trimmed = raw.trim();
+  if (!trimmed || trimmed === 'undefined' || trimmed === 'null') return null;
+  return trimmed;
+}
+
+function getMaxUploadBytesEdge(env: Env): number {
+  const mb = Number(env.MAX_UPLOAD_SIZE_MB || '1500');
+  return Math.max(50, Number.isFinite(mb) ? mb : 1500) * 1024 * 1024;
+}
+
+function validateVideoUploadEdge(env: Env, filename: string, sizeBytes: number): string {
+  const cleanName = sanitizeFilename(filename, 'video.mp4');
+  const dot = cleanName.lastIndexOf('.');
+  const ext = dot >= 0 ? cleanName.slice(dot).toLowerCase() : '';
+  if (!ALLOWED_VIDEO_EXTS_EDGE.has(ext)) {
+    throw new HttpError(
+      `Unsupported video format "${ext || 'unknown'}". Allowed formats: MP4, MOV, MKV.`,
+      400,
+      'UNSUPPORTED_VIDEO_FORMAT'
+    );
+  }
+  if (!Number.isFinite(sizeBytes) || sizeBytes <= 0) {
+    throw new HttpError('Video file cannot be empty.', 400, 'EMPTY_FILE');
+  }
+  const maxBytes = getMaxUploadBytesEdge(env);
+  if (sizeBytes > maxBytes) {
+    throw new HttpError(
+      `File exceeds maximum allowed size (${Math.round(maxBytes / (1024 * 1024))} MB).`,
+      413,
+      'FILE_TOO_LARGE'
+    );
+  }
+  return cleanName;
+}
 
 function isGeminiConfiguredEdge(env: Env): boolean {
   const key = env.GEMINI_API_KEY?.trim() || '';
@@ -221,15 +260,27 @@ async function proxyToExternalBackend(
 
   const targetUrl = `${backendBase}${url.pathname}${url.search}`;
   const forwardHeaders = new Headers(request.headers);
+  forwardHeaders.delete('host');
   forwardHeaders.set('x-forwarded-host', url.host);
   forwardHeaders.set('x-forwarded-proto', url.protocol.replace(':', ''));
 
-  const upstream = await fetch(targetUrl, {
-    method: request.method,
-    headers: forwardHeaders,
-    body: ['GET', 'HEAD'].includes(request.method) ? undefined : request.body,
-    redirect: 'follow',
-  });
+  const hasBody = !['GET', 'HEAD'].includes(request.method) && request.body !== null;
+  let upstream: Response;
+  try {
+    const fetchInit: RequestInit & { duplex?: 'half' } = {
+      method: request.method,
+      headers: forwardHeaders,
+      redirect: 'follow',
+      ...(hasBody ? { body: request.body, duplex: 'half' as const } : {}),
+    };
+    upstream = await fetch(targetUrl, fetchInit);
+  } catch (err) {
+    throw new HttpError(
+      `Failed to reach configured backend server (${err instanceof Error ? err.message : 'network error'}).`,
+      502,
+      'BACKEND_UNREACHABLE'
+    );
+  }
 
   const headers = new Headers(upstream.headers);
   const cors = new Headers(corsHeaders(request));
@@ -273,9 +324,18 @@ export const onRequest = async (context: {
   const method = request.method.toUpperCase();
 
   try {
+    // Forward all API traffic consistently when an external Node/Express backend is configured
+    const proxied = await proxyToExternalBackend(env, request, url);
+    if (proxied) return proxied;
+
     // 1. System Diagnostics & Storage Usage
     if (method === 'GET' && pathname === '/api/system/status') {
       const fishResolved = await resolveFishApiKey(env);
+      const storageDir = !env.DB
+        ? 'UNCONFIGURED (Missing D1 DB binding)'
+        : env.MEDIA_BUCKET
+        ? 'Cloudflare D1 + R2'
+        : 'Cloudflare D1 + IndexedDB';
       return jsonResponse(
         {
           geminiConfigured: isGeminiConfiguredEdge(env),
@@ -283,12 +343,13 @@ export const onRequest = async (context: {
           ffmpegAvailable: false,
           ffprobeAvailable: false,
           ffmpegVersion: 'ffmpeg.wasm (browser)',
-          storageDir: env.MEDIA_BUCKET ? 'Cloudflare D1 + R2' : 'Cloudflare D1 + IndexedDB',
-          maxUploadSizeMb: Number(env.MAX_UPLOAD_SIZE_MB || '1500'),
+          storageDir,
+          maxUploadSizeMb: Math.round(getMaxUploadBytesEdge(env) / (1024 * 1024)),
           tempRetentionHours: Number(env.TEMP_RETENTION_HOURS || '24'),
-          supportedVideoFormats: ['MP4', 'MOV', 'MKV', 'WEBM'],
+          supportedVideoFormats: ['MP4', 'MOV', 'MKV'],
           supportedLogoFormats: ['PNG', 'SVG', 'JPG', 'WEBP'],
           runtime: 'cloudflare-pages',
+          databaseConfigured: Boolean(env.DB),
           d1Available: Boolean(env.DB),
           r2Available: Boolean(env.MEDIA_BUCKET),
           clientProcessingAvailable: true,
@@ -1269,7 +1330,7 @@ export const onRequest = async (context: {
       return jsonResponse({ deleted: true }, 200, request);
     }
 
-    // 7. Chunked Uploads (R2 Multipart when R2 bound; IndexedDB local mode otherwise)
+    // 7. Chunked & Direct Video Uploads (R2 Multipart when R2 bound; D1 + IndexedDB local mode otherwise)
     if (method === 'POST' && pathname === '/api/uploads/init') {
       const db = requireDb(env);
       const body = await readJsonBody<{
@@ -1278,17 +1339,27 @@ export const onRequest = async (context: {
         totalSize?: number;
         totalChunks?: number;
       }>(request);
-      if (!body.projectId || !body.filename || !body.totalSize || !body.totalChunks) {
-        return errorJson('Missing required chunk initialization parameters.', 400, request);
+      const projectId = normalizeProjectIdEdge(body.projectId);
+      if (!projectId) {
+        return errorJson('Invalid or missing projectId.', 400, request, 'INVALID_PROJECT_ID');
       }
-      const project = await getProject(db, body.projectId);
-      if (!project) return errorJson('Project not found.', 404, request);
+      if (!body.filename || !body.totalSize || !body.totalChunks) {
+        return errorJson(
+          'Missing required chunk initialization parameters.',
+          400,
+          request,
+          'INVALID_PARAMS'
+        );
+      }
+
+      const cleanFilename = validateVideoUploadEdge(env, body.filename, Number(body.totalSize));
+      const project = await getProject(db, projectId);
+      if (!project) {
+        return errorJson('Project not found.', 404, request, 'PROJECT_NOT_FOUND');
+      }
 
       const uploadId = crypto.randomUUID();
-      const safeName = `${body.projectId.slice(0, 8)}_${Date.now()}_${sanitizeFilename(
-        body.filename,
-        'video.mp4'
-      )}`;
+      const safeName = `${project.id.slice(0, 8)}_${Date.now()}_${cleanFilename}`;
       const r2Key = `uploads/${safeName}`;
       const mimeType = getMimeType(safeName);
 
@@ -1298,11 +1369,12 @@ export const onRequest = async (context: {
         });
         await db
           .prepare(
-            `INSERT INTO upload_sessions (upload_id, filename, total_size, total_chunks, mime_type, r2_upload_id, r2_key, parts_json, created_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, '[]', ?)`
+            `INSERT INTO upload_sessions (upload_id, project_id, filename, total_size, total_chunks, mime_type, r2_upload_id, r2_key, parts_json, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, '[]', ?)`
           )
           .bind(
             uploadId,
+            project.id,
             safeName,
             Number(body.totalSize),
             Number(body.totalChunks),
@@ -1313,18 +1385,41 @@ export const onRequest = async (context: {
           )
           .run();
         return jsonResponse(
-          { uploadId, totalChunks: Number(body.totalChunks), storageMode: 'r2' },
+          {
+            uploadId,
+            totalChunks: Number(body.totalChunks),
+            projectId: project.id,
+            storageMode: 'r2',
+          },
           200,
           request
         );
       }
 
+      await db
+        .prepare(
+          `INSERT INTO upload_sessions (upload_id, project_id, filename, total_size, total_chunks, mime_type, r2_upload_id, r2_key, parts_json, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, 'indexeddb-local', ?, '[]', ?)`
+        )
+        .bind(
+          uploadId,
+          project.id,
+          cleanFilename,
+          Number(body.totalSize),
+          Number(body.totalChunks),
+          mimeType,
+          r2Key,
+          new Date().toISOString()
+        )
+        .run();
+
       return jsonResponse(
         {
           uploadId,
           totalChunks: Number(body.totalChunks),
+          projectId: project.id,
           storageMode: 'indexeddb-local',
-          suggestedUrl: `/media/uploads/${safeName}`,
+          suggestedUrl: `/media/${r2Key}`,
         },
         200,
         request
@@ -1336,7 +1431,7 @@ export const onRequest = async (context: {
       const db = requireDb(env);
       const chunkIndex = Number(url.searchParams.get('index'));
       if (!Number.isFinite(chunkIndex) || chunkIndex < 0) {
-        return errorJson('Invalid chunk index.', 400, request);
+        return errorJson('Invalid chunk index.', 400, request, 'INVALID_CHUNK_INDEX');
       }
       const session = await db
         .prepare('SELECT * FROM upload_sessions WHERE upload_id = ?')
@@ -1348,11 +1443,15 @@ export const onRequest = async (context: {
           r2_key: string | null;
           parts_json: string;
         }>();
-      if (!session || !env.MEDIA_BUCKET || !session.r2_upload_id || !session.r2_key) {
+      if (!session) {
+        return errorJson('Upload session expired or not found.', 404, request, 'UPLOAD_SESSION_NOT_FOUND');
+      }
+      if (!env.MEDIA_BUCKET || !session.r2_upload_id || session.r2_upload_id === 'indexeddb-local' || !session.r2_key) {
         return errorJson(
           'Server chunk upload requires R2 binding (MEDIA_BUCKET). Use client-side IndexedDB flow when R2 is disabled.',
           400,
-          request
+          request,
+          'R2_NOT_CONFIGURED'
         );
       }
       const bytes = new Uint8Array(await request.arrayBuffer());
@@ -1388,16 +1487,21 @@ export const onRequest = async (context: {
       const db = requireDb(env);
       const body = await readJsonBody<{
         projectId?: string;
+        storageMode?: string;
+        sourceVideoUrl?: string;
+        sourceVideoBlobKey?: string | null;
+        sourceFilename?: string;
         metadata?: Project['metadata'];
         thumbnailDataUrl?: string;
         waveformPeaks?: number[];
       }>(request);
-      const projectId = String(body.projectId || '');
+
       const session = await db
         .prepare('SELECT * FROM upload_sessions WHERE upload_id = ?')
         .bind(params.uploadId)
         .first<{
           upload_id: string;
+          project_id?: string | null;
           filename: string;
           total_size: number;
           mime_type: string;
@@ -1406,8 +1510,72 @@ export const onRequest = async (context: {
           parts_json: string;
         }>();
 
-      if (!session || !env.MEDIA_BUCKET || !session.r2_upload_id || !session.r2_key) {
-        return errorJson('Upload session not found or R2 not configured.', 404, request);
+      if (!session) {
+        return errorJson('Upload session not found.', 404, request, 'UPLOAD_SESSION_NOT_FOUND');
+      }
+
+      const requestedProjectId = normalizeProjectIdEdge(body.projectId);
+      const projectId = requestedProjectId || session.project_id || null;
+      if (!projectId) {
+        return errorJson('Invalid or missing projectId.', 400, request, 'INVALID_PROJECT_ID');
+      }
+      if (session.project_id && session.project_id !== projectId) {
+        return errorJson(
+          'Upload session does not belong to the specified project.',
+          400,
+          request,
+          'PROJECT_ID_MISMATCH'
+        );
+      }
+
+      const existing = await getProject(db, projectId);
+      if (!existing) {
+        return errorJson('Project not found.', 404, request, 'PROJECT_NOT_FOUND');
+      }
+
+      if (session.r2_upload_id === 'indexeddb-local' || body.storageMode === 'indexeddb-local' || !env.MEDIA_BUCKET) {
+        const finalFilename = body.sourceFilename || session.filename;
+        const sourceVideoUrl =
+          body.sourceVideoUrl ||
+          (body.sourceVideoBlobKey ? `idb://blobs/${body.sourceVideoBlobKey}` : existing.sourceVideoUrl);
+        let thumbnailUrl = existing.thumbnailUrl;
+        if (body.thumbnailDataUrl) {
+          thumbnailUrl = (await saveStyleThumbnailDataUrl(env, body.thumbnailDataUrl)) || body.thumbnailDataUrl || thumbnailUrl;
+        }
+        const dur = Math.max(0.5, body.metadata?.duration || existing.metadata?.duration || 12);
+        const updated = await updateProject(db, existing.id, {
+          ...(sourceVideoUrl ? { sourceVideoUrl } : {}),
+          ...(body.sourceVideoBlobKey ? { sourceVideoBlobKey: body.sourceVideoBlobKey } : {}),
+          sourceFilename: finalFilename,
+          thumbnailUrl,
+          ...(body.metadata ? { metadata: body.metadata } : {}),
+          ...(Array.isArray(body.waveformPeaks) ? { waveformPeaks: body.waveformPeaks } : {}),
+          videoClips: [
+            {
+              id: 'vclip_main',
+              label: finalFilename,
+              sourceStart: 0,
+              sourceEnd: dur,
+              timelineStart: 0,
+              speed: 1.0,
+              audioUnlinked: false,
+            },
+          ],
+          originalAudioClips: [],
+          exportSettings: {
+            ...existing.exportSettings,
+            aspectRatio: existing.exportSettings.aspectRatio || 'original',
+          },
+        });
+        await db
+          .prepare('DELETE FROM upload_sessions WHERE upload_id = ?')
+          .bind(params.uploadId)
+          .run();
+        return jsonResponse({ project: updated, metadata: updated?.metadata }, 200, request);
+      }
+
+      if (!session.r2_upload_id || !session.r2_key) {
+        return errorJson('Upload session is missing R2 multipart metadata.', 404, request, 'UPLOAD_SESSION_INVALID');
       }
 
       const multipart = env.MEDIA_BUCKET.resumeMultipartUpload(
@@ -1429,7 +1597,7 @@ export const onRequest = async (context: {
         )
         .bind(
           crypto.randomUUID(),
-          projectId,
+          existing.id,
           session.filename,
           `r2://${session.r2_key}`,
           sourceVideoUrl,
@@ -1439,16 +1607,13 @@ export const onRequest = async (context: {
         )
         .run();
 
-      const existing = await getProject(db, projectId);
-      if (!existing) return errorJson('Project not found', 404, request);
-
       let thumbnailUrl = existing.thumbnailUrl;
       if (body.thumbnailDataUrl) {
         thumbnailUrl = (await saveStyleThumbnailDataUrl(env, body.thumbnailDataUrl)) || thumbnailUrl;
       }
 
       const dur = Math.max(0.5, body.metadata?.duration || existing.metadata?.duration || 12);
-      const updated = await updateProject(db, projectId, {
+      const updated = await updateProject(db, existing.id, {
         sourceVideoUrl,
         sourceFilename: session.filename,
         thumbnailUrl,
@@ -1466,8 +1631,80 @@ export const onRequest = async (context: {
           },
         ],
         originalAudioClips: [],
+        exportSettings: {
+          ...existing.exportSettings,
+          aspectRatio: existing.exportSettings.aspectRatio || 'original',
+        },
       });
 
+      return jsonResponse({ project: updated, metadata: updated?.metadata }, 200, request);
+    }
+
+    // Direct Video Upload (Single-request multipart upload)
+    const directVideoMatch = matchPath('/api/projects/:id/video', pathname);
+    if (method === 'POST' && (directVideoMatch || pathname === '/api/upload')) {
+      const db = requireDb(env);
+      const form = await request.formData();
+      const rawProjectId =
+        directVideoMatch?.id ??
+        (typeof form.get('projectId') === 'string' ? form.get('projectId') : null) ??
+        url.searchParams.get('projectId');
+      const projectId = normalizeProjectIdEdge(rawProjectId);
+      if (!projectId) {
+        return errorJson('Invalid or missing projectId.', 400, request, 'INVALID_PROJECT_ID');
+      }
+
+      const project = await getProject(db, projectId);
+      if (!project) {
+        return errorJson('Project not found.', 404, request, 'PROJECT_NOT_FOUND');
+      }
+
+      const file = form.get('file');
+      if (!file || !(file instanceof File)) {
+        return errorJson('No video file provided.', 400, request, 'NO_FILE_PROVIDED');
+      }
+
+      const cleanFilename = validateVideoUploadEdge(env, file.name || 'video.mp4', file.size);
+      const bytes = new Uint8Array(await file.arrayBuffer());
+      const stored = await saveBinaryAsset(env, {
+        projectId: project.id,
+        kind: 'video',
+        bucket: 'uploads',
+        filename: `${project.id.slice(0, 8)}_${Date.now()}_${cleanFilename}`,
+        mimeType: file.type || getMimeType(cleanFilename),
+        bytes,
+      });
+
+      if (stored.storedIn === 'client-only') {
+        return errorJson(
+          'Direct multipart uploads over 700 KB require an R2 bucket (MEDIA_BUCKET) or chunked IndexedDB upload.',
+          413,
+          request,
+          'R2_REQUIRED_FOR_LARGE_DIRECT_UPLOAD'
+        );
+      }
+
+      const dur = Math.max(0.5, project.metadata?.duration || 12);
+      const updated = await updateProject(db, project.id, {
+        sourceVideoUrl: stored.url,
+        sourceFilename: cleanFilename,
+        videoClips: [
+          {
+            id: 'vclip_main',
+            label: cleanFilename,
+            sourceStart: 0,
+            sourceEnd: dur,
+            timelineStart: 0,
+            speed: 1.0,
+            audioUnlinked: false,
+          },
+        ],
+        originalAudioClips: [],
+        exportSettings: {
+          ...project.exportSettings,
+          aspectRatio: project.exportSettings.aspectRatio || 'original',
+        },
+      });
       return jsonResponse({ project: updated, metadata: updated?.metadata }, 200, request);
     }
 
@@ -2161,10 +2398,6 @@ export const onRequest = async (context: {
       return jsonResponse({ job }, 200, request);
     }
 
-    // 12. Optional external Node backend passthrough for server-FFmpeg routes if configured
-    const proxied = await proxyToExternalBackend(env, request, url);
-    if (proxied) return proxied;
-
     // Direct binary asset read helper check
     if (method === 'GET' && pathname === '/api/assets/read') {
       const targetUrl = url.searchParams.get('url') || '';
@@ -2187,11 +2420,12 @@ export const onRequest = async (context: {
     );
   } catch (err) {
     const status = getErrorStatus(err, 500);
+    const code = getErrorCode(err, status === 503 ? 'SERVICE_UNAVAILABLE' : undefined);
     return errorJson(
       err instanceof Error ? err.message : String(err),
       status,
       request,
-      status === 503 ? 'SERVICE_UNAVAILABLE' : undefined
+      code
     );
   }
 };

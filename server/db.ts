@@ -190,6 +190,7 @@ function rowToProject(row: ProjectRow): Project {
         cloudSync?: Project['cloudSync'];
         cloudAssets?: Project['cloudAssets'];
         savedThumbnails?: Project['savedThumbnails'];
+        sourceVideoBlobKey?: string | null;
       })
     : {};
 
@@ -197,6 +198,7 @@ function rowToProject(row: ProjectRow): Project {
     id: row.id,
     name: row.name,
     sourceVideoUrl: row.source_video_url,
+    sourceVideoBlobKey: parsedCloudMeta.sourceVideoBlobKey ?? null,
     sourceFilename: row.source_filename,
     thumbnailUrl: row.thumbnail_url,
     savedThumbnails: parsedCloudMeta.savedThumbnails || [],
@@ -240,7 +242,9 @@ export function listProjects(): Project[] {
 }
 
 export function getProject(id: string): Project | null {
-  const row = db.prepare('SELECT * FROM projects WHERE id = ?').get(id) as ProjectRow | undefined;
+  const cleanId = typeof id === 'string' ? id.trim() : '';
+  if (!cleanId || cleanId === 'undefined' || cleanId === 'null') return null;
+  const row = db.prepare('SELECT * FROM projects WHERE id = ?').get(cleanId) as ProjectRow | undefined;
   return row ? rowToProject(row) : null;
 }
 
@@ -359,6 +363,7 @@ export function updateProject(id: string, patch: Partial<Project>): Project | nu
       cloudSync: merged.cloudSync,
       cloudAssets: merged.cloudAssets,
       savedThumbnails: merged.savedThumbnails || [],
+      sourceVideoBlobKey: merged.sourceVideoBlobKey ?? null,
     }),
     JSON.stringify(merged.exportSettings),
     merged.lastExportUrl,
@@ -415,6 +420,7 @@ export function upsertProjectFromCloud(cloudProject: Project): Project {
         cloudSync: cloudProject.cloudSync || { syncStatus: 'cloud-synced' },
         cloudAssets: cloudProject.cloudAssets || {},
         savedThumbnails: cloudProject.savedThumbnails || [],
+        sourceVideoBlobKey: cloudProject.sourceVideoBlobKey ?? null,
       }),
       JSON.stringify({ ...DEFAULT_EXPORT_SETTINGS, ...(cloudProject.exportSettings || {}) }),
       cloudProject.lastExportUrl ?? null,

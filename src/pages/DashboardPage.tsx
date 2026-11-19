@@ -23,7 +23,7 @@ import {
   StyleMissingVoiceWarning,
   StudioPreset,
 } from '../types/studio';
-import { api, PresetWarning, uploadVideoChunked } from '../lib/api';
+import { api, ApiHttpError, isValidProjectId, PresetWarning, uploadVideoChunked } from '../lib/api';
 import { formatBytes, formatDurationShort } from '../lib/formatters';
 import { indexedDbStore } from '../lib/indexedDbStore';
 import { importProjectBackupZip } from '../lib/projectBackup';
@@ -59,6 +59,11 @@ export function DashboardPage({
   const [uploadStage, setUploadStage] = useState('');
   const [busySample, setBusySample] = useState(false);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
+  const [failedUploadState, setFailedUploadState] = useState<{
+    file: File;
+    code?: string;
+    projectId?: string;
+  } | null>(null);
   const [presetWarnings, setPresetWarnings] = useState<PresetWarning[]>([]);
   const [voiceMissingWarning, setVoiceMissingWarning] = useState<StyleMissingVoiceWarning | null>(null);
   const [presets, setPresets] = useState<StudioPreset[]>([]);
@@ -176,6 +181,7 @@ export function DashboardPage({
 
   const handleCreateAndUpload = async (file: File) => {
     setErrorMsg(null);
+    setFailedUploadState(null);
     setPresetWarnings([]);
     const ext = file.name.split('.').pop()?.toLowerCase() || '';
     if (!['mp4', 'mov', 'mkv'].includes(ext)) {
@@ -183,6 +189,7 @@ export function DashboardPage({
       return;
     }
 
+    let createdProjectId: string | undefined;
     try {
       setUploadPct(1);
       setUploadStage('Creating project...');
@@ -192,6 +199,10 @@ export function DashboardPage({
           newName.trim() || baseName,
           getSelectedPresetOptions()
         );
+      if (!isValidProjectId(project?.id)) {
+        throw new Error('Project creation did not return a valid project ID. Please try again.');
+      }
+      createdProjectId = project.id;
       handleReportWarnings(warnings, voiceWarn);
 
       const updated = await uploadVideoChunked({
@@ -217,7 +228,16 @@ export function DashboardPage({
       await onRefreshProjects();
       onSelectProject(saved, 'translator');
     } catch (err) {
+      const code = err instanceof ApiHttpError ? err.code : undefined;
       setErrorMsg(err instanceof Error ? err.message : String(err));
+      setFailedUploadState({
+        file,
+        code,
+        projectId: createdProjectId,
+      });
+      if (createdProjectId) {
+        await onRefreshProjects().catch(() => undefined);
+      }
     } finally {
       setUploadPct(null);
       setUploadStage('');
@@ -358,9 +378,32 @@ export function DashboardPage({
       </div>
 
       {errorMsg && (
-        <div className="p-3.5 rounded-lg bg-red-500/10 border border-red-500/30 text-sm text-red-200 flex items-center gap-2.5">
-          <AlertCircle className="w-4 h-4 text-red-400 shrink-0" />
-          <span>{errorMsg}</span>
+        <div
+          role="alert"
+          className="p-3.5 rounded-lg bg-red-500/10 border border-red-500/30 text-sm text-red-200 flex flex-col sm:flex-row sm:items-center justify-between gap-2.5"
+        >
+          <div className="flex items-start gap-2.5">
+            <AlertCircle className="w-4 h-4 text-red-400 shrink-0 mt-0.5" />
+            <span>{errorMsg}</span>
+          </div>
+          {failedUploadState && (
+            <div className="flex flex-wrap items-center gap-2 shrink-0 pl-6 sm:pl-0">
+              <button
+                type="button"
+                onClick={() => void onRefreshProjects()}
+                className="px-2.5 py-1 rounded-md bg-white/10 hover:bg-white/15 text-xs font-medium text-white cursor-pointer"
+              >
+                Refresh Projects
+              </button>
+              <button
+                type="button"
+                onClick={() => void handleCreateAndUpload(failedUploadState.file)}
+                className="px-2.5 py-1 rounded-md bg-violet-600 hover:bg-violet-500 text-xs font-semibold text-white cursor-pointer"
+              >
+                Create New Project &amp; Retry
+              </button>
+            </div>
+          )}
         </div>
       )}
 
