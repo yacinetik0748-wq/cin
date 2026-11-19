@@ -5,6 +5,7 @@
 
 import { Project, CloudAssetManifestEntry } from '../types/studio';
 import { resolveApiUrl } from './api';
+import { getBlobAssetByKey, getBlobAssetUrl } from './browserStorage';
 import { indexedDbStore, normalizeMediaUrlCacheKey } from './indexedDbStore';
 
 const memoizedObjectUrls = new Map<
@@ -89,6 +90,12 @@ export async function resolvePlayableAssetUrl(
     return objectUrl;
   }
 
+  if (url.startsWith('idb://blobs/')) {
+    const key = url.slice('idb://blobs/'.length);
+    const localObjUrl = await getBlobAssetUrl(key).catch(() => null);
+    if (localObjUrl) return localObjUrl;
+  }
+
   if (url.startsWith('idb://')) {
     return null;
   }
@@ -106,10 +113,17 @@ export async function downloadProjectAsset(opts: {
   if (!rawTarget) return;
 
   let blob: Blob | null = null;
-  const cached = await indexedDbStore.getCachedMediaByUrl(rawTarget);
-  if (cached && cached.blob && cached.blob.size > 0) {
-    blob = cached.blob;
-  } else {
+  if (rawTarget.startsWith('idb://blobs/')) {
+    const key = rawTarget.slice('idb://blobs/'.length);
+    blob = await getBlobAssetByKey(key).catch(() => null);
+  }
+  if (!blob) {
+    const cached = await indexedDbStore.getCachedMediaByUrl(rawTarget);
+    if (cached && cached.blob && cached.blob.size > 0) {
+      blob = cached.blob;
+    }
+  }
+  if (!blob) {
     const targetUrl = resolveApiUrl(rawTarget);
     const fetchUrl =
       targetUrl.startsWith('blob:') || targetUrl.startsWith('data:')

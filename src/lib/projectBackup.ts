@@ -1,6 +1,7 @@
 import JSZip from 'jszip';
 import { Project } from '../types/studio';
 import { api, LocalAssetManifestItem } from './api';
+import { getBlobAssetByKey } from './browserStorage';
 import { indexedDbStore } from './indexedDbStore';
 
 interface BackupManifestFile {
@@ -38,14 +39,20 @@ export async function exportProjectBackupZip(
     onProgress?.(pct, `Packaging ${asset.filename}...`);
 
     let blob: Blob | null = null;
-    try {
-      const resp = await fetch(asset.localUrl);
-      if (resp.ok) {
-        blob = await resp.blob();
+    if (asset.localUrl.startsWith('idb://blobs/')) {
+      const key = asset.localUrl.slice('idb://blobs/'.length);
+      blob = await getBlobAssetByKey(key).catch(() => null);
+    }
+    if (!blob) {
+      try {
+        const resp = await fetch(asset.localUrl);
+        if (resp.ok) {
+          blob = await resp.blob();
+        }
+      } catch {
+        const cached = asset.sha256 ? await indexedDbStore.getCachedMedia(asset.sha256) : null;
+        if (cached) blob = cached.blob;
       }
-    } catch {
-      const cached = asset.sha256 ? await indexedDbStore.getCachedMedia(asset.sha256) : null;
-      if (cached) blob = cached.blob;
     }
 
     if (blob) {

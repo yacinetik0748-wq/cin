@@ -1288,6 +1288,8 @@ export interface SystemStatus {
   supportedVideoFormats: string[];
   supportedLogoFormats: string[];
   runtime?: 'express' | 'cloudflare-pages';
+  storageMode?: string;
+  localOnly?: boolean;
   databaseConfigured?: boolean;
   d1Available?: boolean;
   r2Available?: boolean;

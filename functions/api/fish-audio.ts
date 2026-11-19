@@ -88,6 +88,17 @@ export const onRequest = async (context: {
     }
 
     if (pathname.endsWith('/api/fish/saved-voices')) {
+      if (!env.DB) {
+        return jsonResponse(
+          {
+            localOnly: true,
+            storageMode: 'local-indexeddb',
+            voices: [],
+          },
+          200,
+          request
+        );
+      }
       const db = requireDb(env);
       if (method === 'GET') {
         return jsonResponse({ voices: await getSavedFishVoices(db) }, 200, request);

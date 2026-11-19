@@ -331,8 +331,9 @@ export const onRequest = async (context: {
     // 1. System Diagnostics & Storage Usage
     if (method === 'GET' && pathname === '/api/system/status') {
       const fishResolved = await resolveFishApiKey(env);
-      const storageDir = !env.DB
-        ? 'UNCONFIGURED (Missing D1 DB binding)'
+      const hasD1 = Boolean(env.DB);
+      const storageDir = !hasD1
+        ? 'Browser IndexedDB (Local Only)'
         : env.MEDIA_BUCKET
         ? 'Cloudflare D1 + R2'
         : 'Cloudflare D1 + IndexedDB';
@@ -344,13 +345,15 @@ export const onRequest = async (context: {
           ffprobeAvailable: false,
           ffmpegVersion: 'ffmpeg.wasm (browser)',
           storageDir,
+          storageMode: !hasD1 ? 'local-indexeddb' : 'cloudflare-d1',
+          localOnly: !hasD1,
           maxUploadSizeMb: Math.round(getMaxUploadBytesEdge(env) / (1024 * 1024)),
           tempRetentionHours: Number(env.TEMP_RETENTION_HOURS || '24'),
           supportedVideoFormats: ['MP4', 'MOV', 'MKV'],
           supportedLogoFormats: ['PNG', 'SVG', 'JPG', 'WEBP'],
           runtime: 'cloudflare-pages',
-          databaseConfigured: Boolean(env.DB),
-          d1Available: Boolean(env.DB),
+          databaseConfigured: hasD1,
+          d1Available: hasD1,
           r2Available: Boolean(env.MEDIA_BUCKET),
           clientProcessingAvailable: true,
         },
@@ -542,12 +545,6 @@ export const onRequest = async (context: {
       });
     }
 
-    // Saved Voices CRUD
-    if (method === 'GET' && pathname === '/api/fish/saved-voices') {
-      const db = requireDb(env);
-      return jsonResponse({ voices: await getSavedFishVoices(db) }, 200, request);
-    }
-
     if (method === 'POST' && pathname === '/api/fish/saved-voices/validate') {
       const body = await readJsonBody<{ voiceId?: string }>(request);
       return jsonResponse(await validateFishVoiceId(env, String(body.voiceId || '')), 200, request);
@@ -569,6 +566,85 @@ export const onRequest = async (context: {
         return jsonResponse({ audioUrl: `data:audio/mpeg;base64,${b64}` }, 200, request);
       }
       return jsonResponse({ audioUrl: synth.audioUrl }, 200, request);
+    }
+
+    if (method === 'GET' && pathname === '/api/fonts/ensure') {
+      const family = url.searchParams.get('family') || '';
+      const weight = Number(url.searchParams.get('weight') || 700);
+      const italic = url.searchParams.get('italic') === '1' || url.searchParams.get('italic') === 'true';
+      return jsonResponse(
+        await ensureFontAvailableEdge(env, { family, weight, italic }),
+        200,
+        request
+      );
+    }
+
+    // Direct binary asset read helper check (works with R2 or D1 without failing when D1 is absent)
+    if (method === 'GET' && pathname === '/api/assets/read') {
+      const targetUrl = url.searchParams.get('url') || '';
+      const asset = targetUrl ? await readBinaryAssetBytes(env, targetUrl) : null;
+      if (!asset) return errorJson('Asset not found', 404, request);
+      return new Response(asset.bytes, {
+        status: 200,
+        headers: {
+          ...corsHeaders(request),
+          'Content-Type': asset.mimeType,
+        },
+      });
+    }
+
+    // Stateless translation helper if client sends captions directly and GEMINI_API_KEY is configured
+    const translateMatchEdge = matchPath('/api/projects/:id/translate', pathname);
+    if (!env.DB && method === 'POST' && translateMatchEdge) {
+      const body = await readJsonBody<{
+        captions?: CaptionSegment[];
+        sourceLanguage?: string;
+        targetLanguage?: SupportedLanguage;
+        preserveProperNouns?: boolean;
+      }>(request);
+      if (Array.isArray(body.captions) && body.captions.length > 0 && body.targetLanguage) {
+        const translatedSegments = await translateWithGeminiRest(env, {
+          captions: body.captions,
+          sourceLanguage: body.sourceLanguage || 'Auto',
+          targetLanguage: body.targetLanguage,
+          preserveProperNouns: Boolean(body.preserveProperNouns),
+        });
+        return jsonResponse({ localOnly: true, captions: translatedSegments }, 200, request);
+      }
+      return jsonResponse(
+        { localOnly: true, storageMode: 'local-indexeddb', databaseConfigured: false },
+        200,
+        request
+      );
+    }
+
+    // Local-only IndexedDB mode: when Cloudflare D1 (DB) is not bound, do not block the application.
+    // All persistent project/editor CRUD executes in the browser's IndexedDB local-first storage.
+    if (!env.DB) {
+      return jsonResponse(
+        {
+          localOnly: true,
+          storageMode: 'local-indexeddb',
+          databaseConfigured: false,
+          ...(pathname === '/api/projects' && method === 'GET' ? { projects: [] } : {}),
+          ...(pathname === '/api/presets' && method === 'GET' ? { presets: [] } : {}),
+          ...(pathname === '/api/styles' && method === 'GET' ? { styles: [], defaultStyleId: null } : {}),
+          ...(pathname === '/api/fish/saved-voices' && method === 'GET' ? { voices: [] } : {}),
+          ...(pathname === '/api/fonts' && method === 'GET' ? { fonts: [] } : {}),
+          ...(pathname === '/api/fonts/catalog' && method === 'GET'
+            ? { builtin: BUILTIN_FONT_CATALOG, custom: [] }
+            : {}),
+          ...(pathname === '/api/jobs' && method === 'GET' ? { jobs: [] } : {}),
+        },
+        200,
+        request
+      );
+    }
+
+    // Saved Voices CRUD
+    if (method === 'GET' && pathname === '/api/fish/saved-voices') {
+      const db = requireDb(env);
+      return jsonResponse({ voices: await getSavedFishVoices(db) }, 200, request);
     }
 
     if (method === 'POST' && pathname === '/api/fish/saved-voices') {

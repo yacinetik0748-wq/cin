@@ -26,6 +26,7 @@ import {
   SavedFontAsset,
 } from '../types/studio';
 import { api } from '../lib/api';
+import { getBlobAssetByKey } from '../lib/browserStorage';
 import { formatBytes, formatDurationShort } from '../lib/formatters';
 import { indexedDbStore } from '../lib/indexedDbStore';
 import {
@@ -116,6 +117,23 @@ export function ExportCenterPage({
       setExportValidationMsg(null);
       setVideoMetaInfo(null);
       try {
+        if (url.startsWith('idb://blobs/')) {
+          const blobKey = url.slice('idb://blobs/'.length);
+          const localBlob = await getBlobAssetByKey(blobKey).catch(() => null);
+          if (localBlob && localBlob.size >= 1024) {
+            const playUrl = await resolvePlayableAssetUrl(url, project.cloudAssets);
+            if (playUrl) {
+              setResolvedExportUrl(playUrl);
+              setExportValidation('valid');
+              return;
+            }
+          }
+          setExportValidation('error');
+          setExportValidationMsg(
+            'Exported video file not found in local IndexedDB storage. Re-render Final MP4.'
+          );
+          return;
+        }
         const cached = await indexedDbStore.getCachedMediaByUrl(url);
         if (cached && cached.blob && cached.blob.size >= 1024) {
           const playUrl = await resolvePlayableAssetUrl(url, project.cloudAssets);

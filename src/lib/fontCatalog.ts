@@ -1,5 +1,6 @@
 export * from './fontCatalogData.ts';
 import { BUILTIN_FONT_CATALOG, FontStatusEntry, resolveClosestSupportedWeight } from './fontCatalogData.ts';
+import { getBlobAssetUrl } from './browserStorage.ts';
 
 // Runtime browser FontFace registry so we NEVER pretend an unloaded font succeeded
 const statusCache = new Map<string, FontStatusEntry>();
@@ -75,31 +76,79 @@ export async function ensureFontLoaded(params: {
       let source: FontStatusEntry['source'] = customUrl ? 'custom' : 'builtin';
 
       if (!fontUrl) {
-        // Ask server to resolve & cache real TTF file for both browser + FFmpeg libass
-        const resp = await fetch(
-          `/api/fonts/ensure?family=${encodeURIComponent(cleanFamily)}&weight=${resolvedWeight}&italic=${italic ? '1' : '0'}`
-        );
-        const data = (await resp.json()) as {
-          available?: boolean;
-          url?: string;
-          error?: string;
-          source?: 'builtin' | 'custom' | 'system';
-          resolvedWeight?: number;
-        };
-        if (!resp.ok || !data.available || !data.url) {
+        // Ask server/edge to resolve real TTF file for both browser + FFmpeg libass
+        try {
+          const resp = await fetch(
+            `/api/fonts/ensure?family=${encodeURIComponent(cleanFamily)}&weight=${resolvedWeight}&italic=${italic ? '1' : '0'}`
+          );
+          const contentType = resp.headers.get('Content-Type') || '';
+          if (contentType.includes('application/json')) {
+            const data = (await resp.json()) as {
+              available?: boolean;
+              url?: string;
+              error?: string;
+              source?: 'builtin' | 'custom' | 'system';
+              resolvedWeight?: number;
+            };
+            if (resp.ok && data.available && data.url) {
+              fontUrl = data.url;
+              source = data.source || 'builtin';
+            }
+          }
+        } catch {
+          // Offline or no API route: fall through to Google Fonts CSS check
+        }
+
+        if (!fontUrl) {
+          const catalogEntry = BUILTIN_FONT_CATALOG.find(
+            (f) => f.family.toLowerCase() === cleanFamily.toLowerCase()
+          );
+          if (catalogEntry && catalogEntry.family !== 'Impact' && typeof document !== 'undefined') {
+            const familyQuery = encodeURIComponent(catalogEntry.family).replace(/%20/g, '+');
+            const cssHref = italic
+              ? `https://fonts.googleapis.com/css2?family=${familyQuery}:ital,wght@1,${resolvedWeight}&display=swap`
+              : `https://fonts.googleapis.com/css2?family=${familyQuery}:wght@${resolvedWeight}&display=swap`;
+            const id = `gfont_${catalogEntry.family.replace(/[^a-z0-9]/gi, '_')}_${resolvedWeight}`;
+            if (!document.getElementById(id)) {
+              const link = document.createElement('link');
+              link.id = id;
+              link.rel = 'stylesheet';
+              link.href = cssHref;
+              document.head.appendChild(link);
+            }
+            const okEntry: FontStatusEntry = {
+              family: cleanFamily,
+              status: 'loaded',
+              availableForExport: true,
+              source: 'builtin',
+              loadedWeights: [resolvedWeight],
+            };
+            statusCache.set(key, okEntry);
+            statusCache.set(`${cleanFamily}::any`, okEntry);
+            notifyFontListeners();
+            return okEntry;
+          }
           const entry: FontStatusEntry = {
             family: cleanFamily,
             status: 'error',
             availableForExport: false,
-            error: data.error || `Font "${cleanFamily}" file could not be loaded.`,
+            error: `Font "${cleanFamily}" file could not be loaded.`,
           };
           statusCache.set(key, entry);
           statusCache.set(`${cleanFamily}::any`, entry);
           notifyFontListeners();
           return entry;
         }
-        fontUrl = data.url;
-        source = data.source || 'builtin';
+      } else if (fontUrl.startsWith('idb://blobs/')) {
+        const blobKey = fontUrl.slice('idb://blobs/'.length);
+        const resolved = await getBlobAssetUrl(blobKey);
+        if (!resolved) {
+          throw new Error(`Custom font "${cleanFamily}" was not found in IndexedDB.`);
+        }
+        if (/\.woff2?$/i.test(blobKey)) {
+          availableForExport = false;
+        }
+        fontUrl = resolved;
       } else {
         // Verify custom URL is reachable & non-empty
         const head = await fetch(fontUrl, { method: 'HEAD' });
@@ -109,6 +158,15 @@ export async function ensureFontLoaded(params: {
         if (/\.woff2?$/i.test(fontUrl)) {
           availableForExport = false;
         }
+      }
+
+      if (fontUrl.startsWith('idb://blobs/')) {
+        const blobKey = fontUrl.slice('idb://blobs/'.length);
+        const resolved = await getBlobAssetUrl(blobKey);
+        if (!resolved) {
+          throw new Error(`Font asset "${cleanFamily}" missing from IndexedDB.`);
+        }
+        fontUrl = resolved;
       }
 
       if (typeof FontFace !== 'undefined' && typeof document !== 'undefined') {

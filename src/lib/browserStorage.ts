@@ -165,6 +165,22 @@ export async function getEnsureStoreDb(storeName: string): Promise<IDBDatabase> 
   return db;
 }
 
+export function formatIndexedDbError(err: unknown, context?: string): Error {
+  const name = err && typeof err === 'object' && 'name' in err ? String((err as { name?: unknown }).name) : '';
+  const rawMsg = err instanceof Error ? err.message : String(err || 'Unknown IndexedDB error');
+  if (name === 'QuotaExceededError' || /quota|storage.*full/i.test(rawMsg)) {
+    return new Error(
+      `Browser IndexedDB storage quota exceeded${context ? ` (${context})` : ''}. Free up space or delete old exports/projects and try again.`
+    );
+  }
+  if (name === 'SecurityError' || /security|denied|private/i.test(rawMsg)) {
+    return new Error(
+      'Browser IndexedDB access is blocked in this browsing context (private mode or disabled site storage).'
+    );
+  }
+  return err instanceof Error ? err : new Error(rawMsg);
+}
+
 export async function idbGet<T>(storeName: string, key: string): Promise<T | undefined> {
   const db = await getEnsureStoreDb(storeName);
   return new Promise((resolve, reject) => {
@@ -174,7 +190,7 @@ export async function idbGet<T>(storeName: string, key: string): Promise<T | und
       const req = store.get(key);
       req.onerror = () => {
         console.error(`[IndexedDB Error] idbGet failed on store "${storeName}" for key "${key}":`, req.error);
-        reject(req.error);
+        reject(formatIndexedDbError(req.error, `read ${storeName}/${key}`));
       };
       req.onsuccess = () => {
         const res = req.result;
@@ -189,7 +205,7 @@ export async function idbGet<T>(storeName: string, key: string): Promise<T | und
         `[IndexedDB Error] Failed to create readonly transaction on store "${storeName}" (DB version ${db.version}):`,
         err
       );
-      reject(err);
+      reject(formatIndexedDbError(err, `read ${storeName}`));
     }
   });
 }
@@ -214,19 +230,22 @@ export async function idbSet<T>(storeName: string, key: string, value: T): Promi
       const req = store.put(record);
       req.onerror = () => {
         console.error(`[IndexedDB Error] idbSet failed on store "${storeName}" for key "${key}":`, req.error);
-        reject(req.error);
+        reject(formatIndexedDbError(req.error, `write ${storeName}/${key}`));
       };
       tx.oncomplete = () => resolve();
       tx.onerror = () => {
         console.error(`[IndexedDB Error] Transaction error on store "${storeName}":`, tx.error);
-        reject(tx.error);
+        reject(formatIndexedDbError(tx.error, `write ${storeName}/${key}`));
+      };
+      tx.onabort = () => {
+        reject(formatIndexedDbError(tx.error || new Error('IndexedDB write transaction aborted.'), `write ${storeName}/${key}`));
       };
     } catch (err) {
       console.error(
         `[IndexedDB Error] Failed to create readwrite transaction on store "${storeName}" (DB version ${db.version}):`,
         err
       );
-      reject(err);
+      reject(formatIndexedDbError(err, `write ${storeName}`));
     }
   });
 }
@@ -605,5 +624,158 @@ export async function retrieveProjectVideoBlob(
     sourceVideoUrlKind: project.sourceVideoUrl ? project.sourceVideoUrl.split(':')[0] : null,
   });
   return null;
+}
+
+export function buildAssetBlobKey(
+  bucket: string,
+  projectId: string | undefined,
+  filename: string
+): string {
+  const safeName = (filename || 'asset.bin').replace(/[^a-zA-Z0-9._-]+/g, '_');
+  const prefixMap: Record<string, string> = {
+    uploads: 'video',
+    exports: 'export',
+    music: 'bgm',
+    sfx: 'sfx',
+    logos: 'logo',
+    backgrounds: 'bg',
+    thumbs: 'thumb',
+    fonts: 'font',
+    masks: 'mask',
+    audio: 'audio',
+  };
+  const prefix = prefixMap[bucket] || bucket || 'asset';
+  return projectId
+    ? `${prefix}_${projectId}_${Date.now()}_${safeName}`
+    : `${prefix}_${Date.now()}_${safeName}`;
+}
+
+export async function deleteBlobAsset(key: string): Promise<void> {
+  if (!key) return;
+  const cleanKey = key.startsWith('idb://blobs/') ? key.slice('idb://blobs/'.length) : key;
+  if (blobUrls.has(cleanKey)) {
+    try {
+      URL.revokeObjectURL(blobUrls.get(cleanKey)!);
+    } catch {
+      // ignore
+    }
+    blobUrls.delete(cleanKey);
+  }
+  await idbDelete('blobs', cleanKey);
+}
+
+export async function listMergedLocalProjects(): Promise<Project[]> {
+  const [primary, snapshots] = await Promise.all([
+    idbList<Project>('projects'),
+    indexedDbStore.listProjectSnapshots().catch(() => [] as Project[]),
+  ]);
+
+  const byId = new Map<string, Project>();
+  for (const p of primary || []) {
+    if (p && p.id) byId.set(p.id, p);
+  }
+
+  for (const snap of snapshots || []) {
+    if (!snap || !snap.id) continue;
+    const existing = byId.get(snap.id);
+    if (!existing) {
+      byId.set(snap.id, snap);
+      await idbSet('projects', snap.id, snap).catch(() => undefined);
+    } else {
+      const existingTime = Date.parse(existing.updatedAt || existing.createdAt || '') || 0;
+      const snapTime = Date.parse(snap.updatedAt || snap.createdAt || '') || 0;
+      if (snapTime > existingTime) {
+        byId.set(snap.id, snap);
+        await idbSet('projects', snap.id, snap).catch(() => undefined);
+      }
+    }
+  }
+
+  return Array.from(byId.values()).sort((a, b) =>
+    String(b.updatedAt || b.createdAt || '').localeCompare(String(a.updatedAt || a.createdAt || ''))
+  );
+}
+
+export async function deleteProjectLocalAssets(projectId: string): Promise<void> {
+  if (!projectId) return;
+  await Promise.all([
+    idbDelete('projects', projectId).catch(() => undefined),
+    idbDelete('filmstrips', projectId).catch(() => undefined),
+    idbDelete('waveforms', projectId).catch(() => undefined),
+    indexedDbStore.deleteProjectSnapshot(projectId).catch(() => undefined),
+  ]);
+
+  try {
+    const jobs = await idbList<RenderJob>('jobs');
+    for (const job of jobs || []) {
+      if (job?.projectId === projectId && job.id) {
+        await idbDelete('jobs', job.id).catch(() => undefined);
+      }
+    }
+  } catch {
+    // ignore cleanup errors
+  }
+
+  try {
+    const entries = await idbListRawEntries('blobs');
+    for (const entry of entries || []) {
+      if (entry.key && (entry.key.includes(`_${projectId}_`) || entry.key === `video_project_${projectId}`)) {
+        await deleteBlobAsset(entry.key).catch(() => undefined);
+      }
+    }
+  } catch {
+    // ignore cleanup errors
+  }
+}
+
+export async function computeIndexedDbUsage(): Promise<{
+  totalBytes: number;
+  buckets: Record<string, { bytes: number; files: number }>;
+}> {
+  const buckets: Record<string, { bytes: number; files: number }> = {
+    uploads: { bytes: 0, files: 0 },
+    exports: { bytes: 0, files: 0 },
+    audio: { bytes: 0, files: 0 },
+    music: { bytes: 0, files: 0 },
+    logos: { bytes: 0, files: 0 },
+    backgrounds: { bytes: 0, files: 0 },
+    fonts: { bytes: 0, files: 0 },
+    thumbs: { bytes: 0, files: 0 },
+    other: { bytes: 0, files: 0 },
+  };
+  let totalBytes = 0;
+
+  try {
+    const entries = await idbListRawEntries('blobs');
+    for (const entry of entries || []) {
+      const sz = entry.value instanceof Blob ? entry.value.size : 0;
+      if (sz <= 0) continue;
+      totalBytes += sz;
+      const k = entry.key || '';
+      const bucket = k.startsWith('video_')
+        ? 'uploads'
+        : k.startsWith('export_')
+        ? 'exports'
+        : k.startsWith('fish_') || k.startsWith('audio_')
+        ? 'audio'
+        : k.startsWith('bgm_') || k.startsWith('sfx_')
+        ? 'music'
+        : k.startsWith('logo_')
+        ? 'logos'
+        : k.startsWith('bg_')
+        ? 'backgrounds'
+        : k.startsWith('font_')
+        ? 'fonts'
+        : k.startsWith('thumb_')
+        ? 'thumbs'
+        : 'other';
+      buckets[bucket].bytes += sz;
+      buckets[bucket].files += 1;
+    }
+  } catch {
+    // ignore
+  }
+
+  return { totalBytes, buckets };
 }
 

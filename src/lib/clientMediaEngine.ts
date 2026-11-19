@@ -19,6 +19,7 @@ import {
   clampContinuousPauseMs,
   normalizeSyncMode,
 } from '../../server/services/timeline_sync_service';
+import { getBlobAssetByKey } from './browserStorage';
 import { indexedDbStore } from './indexedDbStore';
 
 const CORE_CDN_BASES = [
@@ -87,6 +88,14 @@ export async function safeDeleteMemfsFile(ff: FFmpeg, path: string): Promise<voi
 
 export async function resolveMediaBlob(url: string, resolveUrlFn?: (u: string) => string): Promise<Blob> {
   if (!url) throw new Error('Asset URL is empty.');
+
+  if (url.startsWith('idb://blobs/')) {
+    const key = url.slice('idb://blobs/'.length);
+    const localBlob = await getBlobAssetByKey(key).catch(() => null);
+    if (localBlob && localBlob.size > 0) {
+      return localBlob;
+    }
+  }
 
   const cached = await indexedDbStore.getCachedMediaByUrl(url);
   if (cached && cached.blob && cached.blob.size > 0) {

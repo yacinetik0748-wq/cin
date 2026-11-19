@@ -377,7 +377,11 @@ export async function computeCloudStorageUsage(env: Env): Promise<{
     totalBytes,
     fileCount,
     buckets,
-    storageDir: env.MEDIA_BUCKET ? 'Cloudflare D1 + R2' : 'Cloudflare D1 + IndexedDB (Browser)',
+    storageDir: !env.DB
+      ? 'Browser IndexedDB (Local Only)'
+      : env.MEDIA_BUCKET
+      ? 'Cloudflare D1 + R2'
+      : 'Cloudflare D1 + IndexedDB (Browser)',
     uploadsBytes,
     exportsBytes,
     audioBytes,
