@@ -128,6 +128,12 @@ async function request<T>(url: string, init?: RequestInit): Promise<T> {
   }
 
   if (data) {
+    if (data.localOnly === true || data.storageMode === 'local-indexeddb') {
+      const localResult = await handleLocalApiFallback<T>(url, init);
+      if (localResult !== undefined) {
+        return localResult;
+      }
+    }
     if (!res.ok) {
       const errMsg = typeof data.error === 'string' ? data.error : `Request failed (${res.status})`;
       const errCode = typeof data.code === 'string' ? data.code : undefined;
