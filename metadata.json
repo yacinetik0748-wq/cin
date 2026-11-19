@@ -1,0 +1,6 @@
+{
+  "name": "Recap Studio AI",
+  "description": "AI-powered movie recap video editor with automatic transcription, multi-language translation, AI voice dubbing, advanced blur modes, branding overlays, and FFmpeg MP4 export.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

@@ -1,0 +1,14 @@
+name = "recap-studio-ai"
+pages_build_output_dir = "dist"
+compatibility_date = "2025-03-01"
+compatibility_flags = ["nodejs_compat"]
+
+# OPTIONAL Cloudflare R2 Bucket (Free Tier: 10 GB/month, requires Cloudflare R2 onboarding)
+# Uncomment below if you enable R2. Without R2, large media uses browser IndexedDB.
+# [[r2_buckets]]
+# binding = "MEDIA_BUCKET"
+# bucket_name = "recap-studio-media"
+
+[vars]
+MAX_UPLOAD_SIZE_MB = "1500"
+TEMP_RETENTION_HOURS = "24"

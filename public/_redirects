@@ -1,0 +1,2 @@
+# Cloudflare Pages SPA fallback (API/media routes are handled by _routes.json + Pages Functions)
+/*  /index.html  200
