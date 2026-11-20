@@ -143,7 +143,8 @@ export async function downloadProjectAsset(opts: {
   document.body.appendChild(a);
   a.click();
   document.body.removeChild(a);
-  setTimeout(() => URL.revokeObjectURL(blobUrl), 2500);
+  // Keep blob URL alive for 60 seconds so Android download manager doesn't cancel
+  setTimeout(() => URL.revokeObjectURL(blobUrl), 60000);
 }
 
 export async function hydrateProjectAssetsFromCloud(_project: Project): Promise<Project> {

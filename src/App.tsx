@@ -74,6 +74,7 @@ import {
 } from './types/studio';
 import { api, PresetWarning } from './lib/api';
 import { indexedDbStore } from './lib/indexedDbStore';
+import { localProjectService } from './lib/localProjectService';
 import { LocalBackupModal } from './components/LocalBackupModal';
 import {
   getCloudSession,
@@ -397,6 +398,7 @@ export default function App() {
   }, [refreshPendingOps]);
 
   const loadWorkspaceData = useCallback(async () => {
+    await localProjectService.init();
     const route = parseCurrentRoute();
     const resolveProjectSelection = (list: Project[], prevId: string | null): string | null => {
       // If URL explicitly names a project, preserve it if found (and never hijack to another project)
@@ -3766,7 +3768,7 @@ export default function App() {
                   ? `All changes saved (${new Date(lastSavedAt).toLocaleTimeString()})`
                   : 'All changes saved'
               }
-              className={`hidden sm:flex items-center gap-1.5 px-2.5 py-1 rounded-lg border text-[11px] font-medium whitespace-nowrap shrink-0 transition-colors ${
+              className={`flex items-center gap-1.5 px-2 sm:px-2.5 py-1 rounded-lg border text-[11px] font-medium whitespace-nowrap shrink-0 transition-colors ${
                 saveStatus === 'error'
                   ? 'bg-red-500/15 border-red-500/40 text-red-200'
                   : saveStatus === 'saving' || hasUnsavedChanges
@@ -3789,12 +3791,12 @@ export default function App() {
               ) : saveStatus === 'saving' || hasUnsavedChanges ? (
                 <>
                   <Loader2 className="w-3.5 h-3.5 animate-spin text-amber-300 shrink-0" />
-                  <span>Saving...</span>
+                  <span className="hidden xs:inline">Saving...</span>
                 </>
               ) : (
                 <>
                   <Check className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
-                  <span>Saved</span>
+                  <span className="hidden xs:inline">Saved</span>
                 </>
               )}
             </div>

@@ -7,6 +7,8 @@ import {
   RenderJob,
   FilmstripFrame,
   SyncMode,
+  StyleApplyScope,
+  VideoMetadata,
 } from '../types/studio';
 import {
   buildTimelineSyncPlan,
@@ -14,8 +16,12 @@ import {
   clampContinuousPauseMs,
   normalizeSyncMode,
 } from '../../server/services/timeline_sync_service';
-import { idbGet, idbSet, idbList, idbDelete } from './browserStorage';
+import { idbGet, idbSet, idbList, idbDelete, buildAssetBlobKey } from './browserStorage';
+import { localProjectService } from './localProjectService';
 import { createDefaultMainVideoClip } from './videoTimeline';
+import { BUILTIN_FONT_CATALOG } from './fontCatalogData';
+import { parseSrtOrVtt } from './subtitleAss';
+import { applySavedStyleToProjectData, buildSavedStylePayloadFromProject } from './savedStyles';
 import {
   getStoredFishApiKey,
   getFishAudioSettingsSummary,
@@ -87,135 +93,13 @@ export async function handleLocalApiFallback<T>(url: string, init?: RequestInit)
   }
 
   if (pathname === '/api/projects' && method === 'GET') {
-    const rawProjects = await idbList<Project>('projects');
-    const projects = await Promise.all((rawProjects || []).map((p) => normalizeLocalProjectForLoad(p)));
+    const projects = await localProjectService.getAllProjects();
     return { projects } as unknown as T;
   }
 
   if (pathname === '/api/projects' && method === 'POST') {
     const body = init?.body ? JSON.parse(String(init.body)) : {};
-    const id = crypto.randomUUID();
-    const name = body.name || `Recap Project ${new Date().toLocaleDateString()}`;
-    const newProj: Project = {
-      id,
-      name,
-      createdAt: new Date().toISOString(),
-      updatedAt: new Date().toISOString(),
-      sourceVideoUrl: null,
-      sourceFilename: null,
-      thumbnailUrl: null,
-      metadata: null,
-      waveformPeaks: [],
-      captions: [],
-      subtitleStyle: {
-        enabled: false,
-        mode: 'word-by-word',
-        chunkSize: 3,
-        wordsPerDisplay: 3,
-        highlightBehavior: 'color',
-        transitionDurationMs: 180,
-        timingOffsetSec: 0,
-        template: 'tiktok',
-        fontFamily: 'Montserrat',
-        fontSize: 42,
-        fontWeight: 'bold',
-        fontWeightNum: 700,
-        italic: false,
-        underline: false,
-        primaryColor: '#FFFFFF',
-        highlightColor: '#FFD700',
-        outlineColor: '#000000',
-        outlineWidth: 2,
-        backgroundColor: '#00000088',
-        backgroundOpacity: 60,
-        borderRadius: 0,
-        paddingH: 12,
-        paddingV: 8,
-        shadowEnabled: true,
-        shadowColor: '#000000',
-        shadowBlur: 8,
-        letterSpacing: 0,
-        lineSpacing: 1.2,
-        textAlign: 'center',
-        position: 'bottom',
-        posX: 50,
-        posY: 85,
-        marginV: 40,
-        uppercase: false,
-        useTranslated: false,
-        animationPreset: 'none',
-      },
-      translation: { sourceLanguage: 'English', targetLanguage: 'English', preserveProperNouns: true },
-      voice: {
-        enabled: false,
-        provider: 'fish',
-        syncMode: 'flexible',
-        targetLanguage: 'English',
-        gender: 'female',
-        voiceName: 'Puck',
-        style: 'narrative',
-        narrationStyle: 'cinematic',
-        speakingSpeed: 1.0,
-        voiceVolume: 1.0,
-        timingOffsetSec: 0,
-        preserveOriginalAudio: true,
-        originalAudioVolume: 0.3,
-        fadeInSec: 0.5,
-        fadeOutSec: 0.5,
-        bgMusicVolume: 0.2,
-        generatedClips: [],
-      },
-      blurs: [],
-      logos: [],
-      videoEffects: {
-        filterPreset: 'cinematic',
-        filterIntensity: 100,
-        filterStack: [],
-        adjustments: { brightness: 0, contrast: 0, saturation: 0, exposure: 0, temperature: 0, tint: 0, highlights: 0, shadows: 0, sharpness: 0, vignette: 0, fade: 0 },
-        effects: [],
-        compareMode: false,
-      },
-      canvas: {
-        aspectRatio: '9:16',
-        customWidth: 1080,
-        customHeight: 1920,
-        zoom: 1.0,
-        offsetX: 0,
-        offsetY: 0,
-        cropTop: 0,
-        cropRight: 0,
-        cropBottom: 0,
-        cropLeft: 0,
-        backgroundType: 'solid',
-        bgColor: '#0B0B0F',
-        bgImageScale: 1.0,
-        bgImageOffsetX: 0,
-        bgImageOffsetY: 0,
-        bgBlurIntensity: 20,
-        bgBlurBrightness: 100,
-        bgBlurOpacity: 100,
-      },
-      exportSettings: {
-        aspectRatio: '9:16',
-        resolution: '1080p',
-        fitMode: 'blur-pad',
-        format: 'mp4',
-        videoCodec: 'h264',
-        audioCodec: 'aac',
-        applyBlur: true,
-        applyLogo: true,
-        applyVideoEffects: true,
-        applyCaptions: false,
-        applyDubbing: true,
-        applyAudioMix: true,
-      },
-      lastExportUrl: null,
-      lastExportSize: null,
-      lastExportedAt: null,
-      videoClips: [],
-      originalAudioClips: [],
-    };
-    await idbSet('projects', id, newProj);
+    const newProj = await localProjectService.createProject(body);
     return { project: newProj, presetWarnings: [] } as unknown as T;
   }
 
@@ -254,31 +138,14 @@ export async function handleLocalApiFallback<T>(url: string, init?: RequestInit)
   const exportMatch = /^\/api\/projects\/([^/]+)\/export$/.exec(pathname);
   if (exportMatch && method === 'POST') {
     const projId = exportMatch[1];
-    const proj = await idbGet<Project>('projects', projId);
-    const jobId = crypto.randomUUID();
-    const now = new Date().toISOString();
-    const job: RenderJob = {
-      id: jobId,
-      projectId: projId,
-      type: 'render',
-      status: 'completed',
-      progress: 100,
-      stage: 'Render complete (Browser export)',
-      etaSeconds: 0,
-      outputUrl: proj?.sourceVideoUrl || null,
-      outputSize: proj?.metadata?.fileSize || null,
-      error: null,
-      createdAt: now,
-      updatedAt: now,
-    };
-    await idbSet('jobs', jobId, job);
-    if (proj) {
-      proj.lastExportUrl = proj.sourceVideoUrl;
-      proj.lastExportSize = proj.metadata?.fileSize || null;
-      proj.lastExportedAt = now;
-      await idbSet('projects', projId, proj);
-    }
-    return { job } as unknown as T;
+    const body = init?.body ? JSON.parse(String(init.body)) : {};
+    const proj = await localProjectService.getProject(projId);
+    if (!proj) throw new Error('Project not found');
+    const exportResult = await localProjectService.startLocalExport(
+      projId,
+      body.settings || proj.exportSettings
+    );
+    return { job: exportResult.job } as unknown as T;
   }
 
   // Jobs
@@ -355,6 +222,13 @@ export async function handleLocalApiFallback<T>(url: string, init?: RequestInit)
     return { project: updated, metadata: updated.metadata } as unknown as T;
   }
 
+  const mediaMatch = /^\/api\/projects\/([^/]+)\/media$/.exec(pathname);
+  if (mediaMatch && method === 'GET') {
+    const projId = decodeURIComponent(mediaMatch[1] || '').trim();
+    const media = await localProjectService.getProjectMedia(projId);
+    return media as unknown as T;
+  }
+
   const projMatch = /^\/api\/projects\/([^/]+)$/.exec(pathname);
   if (projMatch) {
     const projId = decodeURIComponent(projMatch[1] || '').trim();
@@ -362,34 +236,334 @@ export async function handleLocalApiFallback<T>(url: string, init?: RequestInit)
       throw new Error('Invalid or missing projectId.');
     }
     if (method === 'GET') {
-      const proj = await idbGet<Project>('projects', projId);
+      const proj = await localProjectService.getProject(projId);
       if (!proj) throw new Error('Project not found');
-      const normalized = await normalizeLocalProjectForLoad(proj);
-      return { project: normalized } as unknown as T;
+      return { project: proj } as unknown as T;
     }
     if (method === 'PATCH') {
       const patch = init?.body ? JSON.parse(String(init.body)) : {};
-      const proj = await idbGet<Project>('projects', projId);
-      if (!proj) throw new Error('Project not found');
-      const updated = { ...proj, ...patch, updatedAt: new Date().toISOString() };
-      await idbSet('projects', projId, updated);
+      const updated = await localProjectService.updateProject(projId, patch);
       return { project: updated } as unknown as T;
     }
     if (method === 'DELETE') {
-      await idbDelete('projects', projId);
-      return { deleted: true } as unknown as T;
+      const success = await localProjectService.deleteProject(projId);
+      return { deleted: success } as unknown as T;
     }
   }
 
-  if (pathname === '/api/presets' && method === 'GET') {
-    const presets = await idbList<StudioPreset>('presets');
-    return { presets: presets || [] } as unknown as T;
+  if (pathname === '/api/presets') {
+    if (method === 'GET') {
+      const category = parsedUrl.searchParams.get('category');
+      const all = (await idbList<StudioPreset>('presets')) || [];
+      const presets = category ? all.filter((p) => p.category === category) : all;
+      return { presets } as unknown as T;
+    }
+    if (method === 'POST') {
+      const body = init?.body ? JSON.parse(String(init.body)) : {};
+      const now = new Date().toISOString();
+      const preset: StudioPreset = {
+        id: crypto.randomUUID(),
+        category: body.category || 'caption',
+        name: String(body.name || 'Untitled Preset'),
+        description: body.description,
+        isDefault: Boolean(body.isDefault),
+        thumbnailStyle: body.thumbnailStyle,
+        payload: body.payload || {},
+        assetRefs: body.assetRefs,
+        createdAt: now,
+        updatedAt: now,
+      };
+      await idbSet('presets', preset.id, preset);
+      const presets = (await idbList<StudioPreset>('presets')) || [];
+      return { preset, presets } as unknown as T;
+    }
   }
 
-  if (pathname === '/api/styles' && method === 'GET') {
-    const presets = await idbList<StudioPreset>('presets');
-    const styles = (presets || []).filter(p => p.category === 'style');
-    return { styles, defaultStyleId: null } as unknown as T;
+  const presetIdMatch = /^\/api\/presets\/([^/]+)$/.exec(pathname);
+  if (presetIdMatch) {
+    const id = presetIdMatch[1];
+    if (method === 'PATCH') {
+      const patch = init?.body ? JSON.parse(String(init.body)) : {};
+      const found = await idbGet<StudioPreset>('presets', id);
+      if (!found) throw new Error('Preset not found');
+      const updated = { ...found, ...patch, updatedAt: new Date().toISOString() };
+      await idbSet('presets', id, updated);
+      const presets = (await idbList<StudioPreset>('presets')) || [];
+      return { preset: updated, presets } as unknown as T;
+    }
+    if (method === 'DELETE') {
+      await idbDelete('presets', id);
+      const presets = (await idbList<StudioPreset>('presets')) || [];
+      return { deleted: true, presets } as unknown as T;
+    }
+  }
+
+  if (pathname === '/api/styles') {
+    if (method === 'GET') {
+      const presets = (await idbList<StudioPreset>('presets')) || [];
+      const styles = presets.filter((p) => p.category === 'style');
+      const def = styles.find((s) => s.isDefault);
+      return { styles, defaultStyleId: def?.id || null } as unknown as T;
+    }
+    if (method === 'POST') {
+      const body = init?.body ? JSON.parse(String(init.body)) : {};
+      const now = new Date().toISOString();
+      let payload = body.payload || {};
+      let thumbnailStyle = body.thumbnailStyle;
+      let assetRefs = body.assetRefs;
+
+      if (body.projectId && !body.payload) {
+        const srcProj = await localProjectService.getProject(String(body.projectId));
+        if (srcProj) {
+          const savedVoices = (await idbList<SavedFishVoice>('saved_fish_voices')) || [];
+          const built = buildSavedStylePayloadFromProject(srcProj, {
+            savedVoices,
+            thumbnailImageUrl: body.thumbnailImageUrl || body.thumbnailDataUrl,
+          });
+          payload = built.payload;
+          thumbnailStyle = built.thumbnailStyle;
+          assetRefs = built.assetRefs;
+        }
+      }
+
+      const style: StudioPreset = {
+        id: crypto.randomUUID(),
+        category: 'style',
+        name: String(body.name || 'Saved Style'),
+        description: body.description,
+        isDefault: Boolean(body.isDefault),
+        thumbnailStyle,
+        payload,
+        assetRefs,
+        createdAt: now,
+        updatedAt: now,
+      };
+      if (style.isDefault) {
+        const all = (await idbList<StudioPreset>('presets')) || [];
+        for (const p of all) {
+          if (p.category === 'style' && p.isDefault) {
+            await idbSet('presets', p.id, { ...p, isDefault: false });
+          }
+        }
+      }
+      await idbSet('presets', style.id, style);
+      const all = (await idbList<StudioPreset>('presets')) || [];
+      const styles = all.filter((p) => p.category === 'style');
+      return { style, styles } as unknown as T;
+    }
+  }
+
+  const dupStyleMatch = /^\/api\/styles\/([^/]+)\/duplicate$/.exec(pathname);
+  if (dupStyleMatch && method === 'POST') {
+    const id = dupStyleMatch[1];
+    const found = await idbGet<StudioPreset>('presets', id);
+    if (!found) throw new Error('Style not found');
+    const now = new Date().toISOString();
+    const copy: StudioPreset = {
+      ...found,
+      id: crypto.randomUUID(),
+      name: `${found.name} (Copy)`,
+      isDefault: false,
+      createdAt: now,
+      updatedAt: now,
+    };
+    await idbSet('presets', copy.id, copy);
+    const all = (await idbList<StudioPreset>('presets')) || [];
+    return { style: copy, styles: all.filter((p) => p.category === 'style') } as unknown as T;
+  }
+
+  const styleIdMatch = /^\/api\/styles\/([^/]+)$/.exec(pathname);
+  if (styleIdMatch) {
+    const id = styleIdMatch[1];
+    if (method === 'PATCH') {
+      const patch = init?.body ? JSON.parse(String(init.body)) : {};
+      const found = await idbGet<StudioPreset>('presets', id);
+      if (!found) throw new Error('Style not found');
+      const updated = { ...found, ...patch, updatedAt: new Date().toISOString() };
+      if (patch.isDefault) {
+        const all = (await idbList<StudioPreset>('presets')) || [];
+        for (const p of all) {
+          if (p.id !== id && p.category === 'style' && p.isDefault) {
+            await idbSet('presets', p.id, { ...p, isDefault: false });
+          }
+        }
+      }
+      await idbSet('presets', id, updated);
+      const all = (await idbList<StudioPreset>('presets')) || [];
+      return { style: updated, styles: all.filter((p) => p.category === 'style') } as unknown as T;
+    }
+    if (method === 'DELETE') {
+      await idbDelete('presets', id);
+      const all = (await idbList<StudioPreset>('presets')) || [];
+      return { deleted: true, styles: all.filter((p) => p.category === 'style') } as unknown as T;
+    }
+  }
+
+  const applyStyleMatch = /^\/api\/projects\/([^/]+)\/apply-style$/.exec(pathname);
+  if (applyStyleMatch && method === 'POST') {
+    const projId = applyStyleMatch[1];
+    const proj = await localProjectService.getProject(projId);
+    if (!proj) throw new Error('Project not found');
+    const body = init?.body ? JSON.parse(String(init.body)) : {};
+    const style = await idbGet<StudioPreset>('presets', String(body.styleId || ''));
+    if (!style) throw new Error('Saved style not found');
+    const scope = (body.scope || 'all') as StyleApplyScope;
+    const savedVoices = (await idbList<SavedFishVoice>('saved_fish_voices')) || [];
+    const customFonts = (await idbList<SavedFontAsset>('fonts')) || [];
+    const availUrls = new Set(customFonts.map((f) => f.url));
+
+    const res = applySavedStyleToProjectData({
+      project: proj,
+      style,
+      scope,
+      savedVoices,
+      checkAssetAvailable: (u) => Boolean(u && (u.startsWith('idb://blobs/') || availUrls.has(u))),
+      generateId: () => crypto.randomUUID(),
+      preserveCaptionEnabledState: true,
+    });
+    const updated =
+      Object.keys(res.patch).length > 0
+        ? await localProjectService.updateProject(projId, res.patch)
+        : proj;
+    return {
+      project: updated,
+      warnings: res.warnings,
+      voiceMissingWarning: res.voiceMissingWarning,
+    } as unknown as T;
+  }
+
+  const applyPresetsMatch = /^\/api\/projects\/([^/]+)\/apply-presets$/.exec(pathname);
+  if (applyPresetsMatch && method === 'POST') {
+    const projId = applyPresetsMatch[1];
+    const proj = await localProjectService.getProject(projId);
+    if (!proj) throw new Error('Project not found');
+    return { project: proj, presetWarnings: [] } as unknown as T;
+  }
+
+  const importCaptionsMatch = /^\/api\/projects\/([^/]+)\/captions\/import$/.exec(pathname);
+  if (importCaptionsMatch && method === 'POST') {
+    const projId = importCaptionsMatch[1];
+    const proj = await localProjectService.getProject(projId);
+    if (!proj) throw new Error('Project not found');
+    const body = init?.body ? JSON.parse(String(init.body)) : {};
+    const parsed = parseSrtOrVtt(String(body.content || ''));
+    const updated = await localProjectService.updateProject(projId, { captions: parsed });
+    return { project: updated, count: parsed.length } as unknown as T;
+  }
+
+  const saveThumbMatch = /^\/api\/projects\/([^/]+)\/thumbnails\/save$/.exec(pathname);
+  if (saveThumbMatch && method === 'POST') {
+    const projId = saveThumbMatch[1];
+    const proj = await localProjectService.getProject(projId);
+    if (!proj) throw new Error('Project not found');
+    const fd = init?.body as FormData;
+    const file = fd?.get('file') as File | Blob | null;
+    if (!file) throw new Error('Missing thumbnail image blob.');
+    const label = String(fd.get('label') || 'Cover');
+    const width = Number(fd.get('width') || 1080);
+    const height = Number(fd.get('height') || 1920);
+    const format = String(fd.get('format') || 'png') === 'jpg' ? 'jpg' : 'png';
+    const setAsCover = String(fd.get('setAsCover')) === 'true';
+
+    const key = buildAssetBlobKey('thumbs', projId, `thumb_${Date.now()}.${format}`);
+    const durableUrl = await localProjectService.saveProjectMedia(
+      projId,
+      key,
+      file,
+      format === 'jpg' ? 'image/jpeg' : 'image/png'
+    );
+    const entry = {
+      id: crypto.randomUUID(),
+      url: durableUrl,
+      label,
+      width,
+      height,
+      format: format as 'png' | 'jpg',
+      createdAt: new Date().toISOString(),
+    };
+    const updated = await localProjectService.updateProject(projId, {
+      ...(setAsCover ? { thumbnailUrl: durableUrl } : {}),
+      savedThumbnails: [entry, ...(proj.savedThumbnails || [])],
+    });
+    return { thumbnail: entry, project: updated } as unknown as T;
+  }
+
+  const maskMatch = /^\/api\/projects\/([^/]+)\/mask$/.exec(pathname);
+  if (maskMatch && method === 'POST') {
+    const projId = maskMatch[1];
+    const body = init?.body ? JSON.parse(String(init.body)) : {};
+    const b64 = String(body.maskBase64 || '');
+    const resp = await fetch(b64.startsWith('data:') ? b64 : `data:image/png;base64,${b64}`);
+    const blob = await resp.blob();
+    const assetId = `mask_${body.blurId || crypto.randomUUID()}`;
+    const key = buildAssetBlobKey('masks', projId, `${assetId}.png`);
+    const maskUrl = await localProjectService.saveProjectMedia(projId, key, blob, 'image/png');
+    return { maskUrl, assetId } as unknown as T;
+  }
+
+  const sampleVideoMatch = /^\/api\/projects\/([^/]+)\/sample-video$/.exec(pathname);
+  if (sampleVideoMatch && method === 'POST') {
+    const projId = sampleVideoMatch[1];
+    const proj = await localProjectService.getProject(projId);
+    if (!proj) throw new Error('Project not found');
+    const canvas = document.createElement('canvas');
+    canvas.width = 720;
+    canvas.height = 1280;
+    const ctx = canvas.getContext('2d');
+    const stream = canvas.captureStream(24);
+    const mime = MediaRecorder.isTypeSupported('video/webm;codecs=vp8') ? 'video/webm;codecs=vp8' : 'video/webm';
+    const rec = new MediaRecorder(stream, { mimeType: mime });
+    const chunks: Blob[] = [];
+    rec.ondataavailable = (e) => { if (e.data.size > 0) chunks.push(e.data); };
+    const blob = await new Promise<Blob>((resolve) => {
+      rec.onstop = () => resolve(new Blob(chunks, { type: mime }));
+      rec.start(100);
+      let frame = 0;
+      const timer = setInterval(() => {
+        if (ctx) {
+          ctx.fillStyle = '#0B0B12';
+          ctx.fillRect(0, 0, 720, 1280);
+          ctx.fillStyle = '#7C3AED';
+          ctx.fillRect(60, 420 + Math.sin(frame / 5) * 40, 600, 12);
+          ctx.fillStyle = '#FFFFFF';
+          ctx.font = 'bold 42px sans-serif';
+          ctx.textAlign = 'center';
+          ctx.fillText('LOCAL SAMPLE RECAP', 360, 620);
+          ctx.font = '24px monospace';
+          ctx.fillStyle = '#A1A1AA';
+          ctx.fillText(`00:0${Math.min(5, Math.floor(frame / 24))}`, 360, 680);
+        }
+        frame += 1;
+        if (frame >= 72) {
+          clearInterval(timer);
+          rec.stop();
+        }
+      }, 42);
+    });
+    const key = buildAssetBlobKey('uploads', projId, 'sample_recap.webm');
+    const durableUrl = await localProjectService.saveProjectMedia(projId, key, blob, mime);
+    const thumbDataUrl = canvas.toDataURL('image/jpeg', 0.8);
+    const meta: VideoMetadata = {
+      duration: 3,
+      width: 720,
+      height: 1280,
+      fps: 24,
+      videoCodec: 'vp8',
+      audioCodec: null,
+      bitrate: 1500000,
+      fileSize: blob.size,
+      hasAudio: false,
+      formatName: 'webm',
+    };
+    const updated = await localProjectService.updateProject(projId, {
+      sourceVideoUrl: durableUrl,
+      sourceVideoBlobKey: key,
+      sourceFilename: 'sample_recap.webm',
+      thumbnailUrl: thumbDataUrl,
+      metadata: meta,
+      videoClips: [createDefaultMainVideoClip({ filename: 'sample_recap.webm', duration: 3 })],
+    });
+    return { project: updated } as unknown as T;
   }
 
   if (pathname === '/api/settings/preferences' && method === 'GET') {
@@ -707,9 +881,69 @@ export async function handleLocalApiFallback<T>(url: string, init?: RequestInit)
     return { project: updated, fullDubUrl: updated.voice.fullDubUrl || '', clips } as unknown as T;
   }
 
-  if (pathname === '/api/fonts' && method === 'GET') {
+  if (pathname === '/api/fonts/catalog' && method === 'GET') {
+    const custom = (await idbList<SavedFontAsset>('fonts')) || [];
+    return { builtin: BUILTIN_FONT_CATALOG, custom } as unknown as T;
+  }
+
+  if (pathname === '/api/fonts/ensure' && method === 'GET') {
+    const family = parsedUrl.searchParams.get('family') || '';
+    const weight = Number(parsedUrl.searchParams.get('weight') || 700);
+    const italic = parsedUrl.searchParams.get('italic') === '1';
+    const customFonts = (await idbList<SavedFontAsset>('fonts')) || [];
+    const customMatch = customFonts.find((f) => f.family.toLowerCase() === family.toLowerCase());
+    if (customMatch) {
+      return {
+        available: true,
+        family: customMatch.family,
+        resolvedWeight: weight,
+        italic,
+        url: customMatch.url,
+        source: 'custom',
+        exportCompatible: true,
+      } as unknown as T;
+    }
+    return {
+      available: true,
+      family,
+      resolvedWeight: weight,
+      italic,
+      source: 'builtin',
+      exportCompatible: true,
+    } as unknown as T;
+  }
+
+  if (pathname === '/api/fonts') {
+    if (method === 'GET') {
+      const fonts = (await idbList<SavedFontAsset>('fonts')) || [];
+      return { fonts } as unknown as T;
+    }
+    if (method === 'POST') {
+      const fd = init?.body as FormData;
+      const file = fd?.get('file') as File | null;
+      if (!file) throw new Error('Font file missing');
+      const familyRaw = String(fd.get('family') || file.name.replace(/\.[^.]+$/, ''));
+      const id = crypto.randomUUID();
+      const key = buildAssetBlobKey('fonts', 'global', `${id}_${file.name}`);
+      const durableUrl = await localProjectService.saveProjectMedia('global', key, file, file.type || 'font/ttf');
+      const fontAsset: SavedFontAsset = {
+        id,
+        family: familyRaw,
+        filename: file.name,
+        url: durableUrl,
+        createdAt: new Date().toISOString(),
+      };
+      await idbSet('fonts', id, fontAsset);
+      const fonts = (await idbList<SavedFontAsset>('fonts')) || [];
+      return { font: fontAsset, fonts, exportCompatible: true } as unknown as T;
+    }
+  }
+
+  const fontIdMatch = /^\/api\/fonts\/([^/]+)$/.exec(pathname);
+  if (fontIdMatch && method === 'DELETE') {
+    await idbDelete('fonts', fontIdMatch[1]);
     const fonts = (await idbList<SavedFontAsset>('fonts')) || [];
-    return { fonts } as unknown as T;
+    return { deleted: true, fonts } as unknown as T;
   }
 
   return undefined;

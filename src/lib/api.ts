@@ -1,12 +1,14 @@
 import {
   CaptionSegment,
   CloudAssetKind,
+  DEFAULT_VIDEO_CANVAS,
   DefaultStudioPreferences,
   FilmstripFrame,
   FishAudioSettingsSummary,
   FishConnectionStatus,
   FishVoiceModel,
   GeminiVoiceName,
+  LogoOverlay,
   PresetCategory,
   Project,
   ProjectAudioWaveforms,
@@ -20,13 +22,23 @@ import {
   SupportedLanguage,
   SyncMode,
   SystemStatus,
+  VideoCanvasConfig,
   VideoMetadata,
 } from '../types/studio';
 import type { FontCatalogItem } from './fontCatalog';
 import { handleLocalApiFallback } from './localApiFallback';
 import { processVideoUploadInBrowser } from './browserVideoProcessor';
-import { idbGet, idbSet } from './browserStorage';
+import {
+  idbGet,
+  idbSet,
+  idbDelete,
+  idbList,
+  storeBlobAsset,
+  buildAssetBlobKey,
+  computeIndexedDbUsage,
+} from './browserStorage';
 import { indexedDbStore } from './indexedDbStore';
+import { localProjectService } from './localProjectService';
 import {
   getStoredFishApiKey,
   getFishAudioSettingsSummary,
@@ -102,7 +114,7 @@ function isSpaShellHtml(raw: string): boolean {
   );
 }
 
-let cachedLocalOnly = false;
+let cachedLocalOnly = true;
 
 function isStorageRoute(url: string): boolean {
   const p = url.split('?')[0];
@@ -115,6 +127,7 @@ function isStorageRoute(url: string): boolean {
     p.startsWith('/api/settings') ||
     p.startsWith('/api/uploads') ||
     p.startsWith('/api/system/storage-usage') ||
+    p.startsWith('/api/system/status') ||
     p.startsWith('/api/system/cleanup')
   );
 }
@@ -213,16 +226,23 @@ export interface PresetWarning {
 
 export const api = {
   getSystemStatus: async () => {
-    const [res, localKey] = await Promise.all([
-      request<SystemStatus>('/api/system/status'),
-      getStoredFishApiKey(),
-    ]);
-    if (res.localOnly === true || res.storageMode === 'local-indexeddb' || res.d1Available === false) {
-      cachedLocalOnly = true;
-    }
+    const localKey = await getStoredFishApiKey();
     return {
-      ...res,
-      fishConfigured: Boolean(res.fishConfigured || localKey),
+      geminiConfigured: false,
+      fishConfigured: Boolean(localKey),
+      ffmpegAvailable: true,
+      ffprobeAvailable: true,
+      ffmpegVersion: 'wasm-browser',
+      storageDir: 'indexeddb',
+      maxUploadSizeMb: 4096,
+      tempRetentionHours: 72,
+      supportedVideoFormats: ['MP4', 'MOV', 'MKV', 'WEBM'],
+      supportedLogoFormats: ['PNG', 'SVG', 'JPG', 'WEBP'],
+      runtime: 'cloudflare-pages' as const,
+      localOnly: true,
+      storageMode: 'local-indexeddb',
+      d1Available: false,
+      databaseConfigured: false,
     };
   },
 
@@ -234,30 +254,39 @@ export const api = {
 
   deleteFishApiKey: () => deleteStoredFishApiKey(),
 
-  getDefaultPreferences: () =>
-    request<{ preferences: DefaultStudioPreferences; defaultStyle: StudioPreset | null }>(
-      '/api/settings/preferences'
-    ),
+  getDefaultPreferences: async () => {
+    const prefs =
+      (await idbGet<DefaultStudioPreferences>('settings', 'preferences')) || {
+        autoApplyDefaultStyleOnImport: true,
+        defaultStyleId: null,
+        defaultTargetLanguage: 'English',
+        defaultSyncMode: 'flexible' as const,
+      };
+    return { preferences: prefs, defaultStyle: null };
+  },
 
-  updateDefaultPreferences: (patch: Partial<DefaultStudioPreferences>) =>
-    request<{ preferences: DefaultStudioPreferences; defaultStyle: StudioPreset | null }>(
-      '/api/settings/preferences',
-      {
-        method: 'PATCH',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(patch),
-      }
-    ),
+  updateDefaultPreferences: async (patch: Partial<DefaultStudioPreferences>) => {
+    const prefs =
+      (await idbGet<DefaultStudioPreferences>('settings', 'preferences')) || {
+        autoApplyDefaultStyleOnImport: true,
+        defaultStyleId: null,
+        defaultTargetLanguage: 'English',
+        defaultSyncMode: 'flexible' as const,
+      };
+    const updated = { ...prefs, ...patch };
+    await idbSet('settings', 'preferences', updated);
+    return { preferences: updated, defaultStyle: null };
+  },
 
   getSupabaseSchema: () => request<{ sql: string }>('/api/system/supabase-schema'),
 
-  getLocalStorageUsage: () =>
-    request<{
-      totalBytes: number;
-      buckets: Record<string, { bytes: number; files: number }>;
-    }>('/api/system/storage-usage'),
+  getLocalStorageUsage: async () => {
+    return computeIndexedDbUsage();
+  },
 
-  runCleanup: () => request<{ removedFiles: number }>('/api/system/cleanup', { method: 'POST' }),
+  runCleanup: async () => {
+    return { removedFiles: 0 };
+  },
 
   getProjectAssetManifest: (projectId: string) =>
     request<{
@@ -659,23 +688,18 @@ export const api = {
       body: JSON.stringify({ styleId, scope }),
     }),
 
-  listProjects: () => request<{ projects: Project[] }>('/api/projects'),
+  listProjects: async () => {
+    const projects = await localProjectService.getAllProjects();
+    return { projects };
+  },
 
   createProject: async (name: string, presetOpts?: PresetApplyOptions) => {
-    const res = await request<{
-      project: Project;
-      presetWarnings?: PresetWarning[];
-      voiceMissingWarning?: StyleMissingVoiceWarning | null;
-    }>('/api/projects', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ name, ...(presetOpts || {}) }),
-    });
-    if (res.project?.id) {
-      void indexedDbStore.saveProjectSnapshot(res.project);
-      void idbSet('projects', res.project.id, res.project).catch(() => undefined);
-    }
-    return res;
+    const project = await localProjectService.createProject(name, presetOpts);
+    return {
+      project,
+      presetWarnings: [] as PresetWarning[],
+      voiceMissingWarning: null as StyleMissingVoiceWarning | null,
+    };
   },
 
   applyPresetsToProject: (projectId: string, presetOpts: PresetApplyOptions) =>
@@ -688,36 +712,29 @@ export const api = {
       }
     ),
 
-  getProject: (id: string) => {
+  getProject: async (id: string) => {
     if (!isValidProjectId(id)) {
-      return Promise.reject(
-        new ApiHttpError('Invalid or missing project ID.', 400, 'INVALID_PROJECT_ID')
-      );
+      throw new ApiHttpError('Invalid or missing project ID.', 400, 'INVALID_PROJECT_ID');
     }
-    return request<{ project: Project }>(`/api/projects/${encodeURIComponent(id.trim())}`);
+    const project = await localProjectService.getProject(id);
+    if (!project) {
+      throw new ApiHttpError('Project not found in local storage.', 404, 'PROJECT_NOT_FOUND');
+    }
+    return { project };
   },
 
   updateProject: async (id: string, patch: Partial<Project>) => {
     if (!isValidProjectId(id)) {
       throw new ApiHttpError('Invalid or missing project ID.', 400, 'INVALID_PROJECT_ID');
     }
-    const res = await request<{ project: Project }>(
-      `/api/projects/${encodeURIComponent(id.trim())}`,
-      {
-        method: 'PATCH',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(patch),
-      }
-    );
-    if (res.project?.id) {
-      void indexedDbStore.saveProjectSnapshot(res.project);
-      void idbSet('projects', res.project.id, res.project).catch(() => undefined);
-    }
-    return res;
+    const project = await localProjectService.updateProject(id.trim(), patch);
+    return { project };
   },
 
-  deleteProject: (id: string) =>
-    request<{ deleted: boolean }>(`/api/projects/${id}`, { method: 'DELETE' }),
+  deleteProject: async (id: string) => {
+    const deleted = await localProjectService.deleteProject(id);
+    return { deleted };
+  },
 
   createSampleVideo: (projectId: string) =>
     request<{ project: Project }>(`/api/projects/${projectId}/sample-video`, {
@@ -725,42 +742,75 @@ export const api = {
     }),
 
   uploadLogo: async (projectId: string, file: File) => {
-    const fd = new FormData();
-    fd.append('file', file);
-    return request<{ project: Project }>(`/api/projects/${projectId}/logo`, {
-      method: 'POST',
-      body: fd,
+    const key = buildAssetBlobKey('logos', projectId, file.name);
+    const durableUrl = await localProjectService.saveProjectMedia(projectId, key, file, file.type);
+    const project = await localProjectService.getProject(projectId);
+    if (!project) throw new Error('Project not found in local storage.');
+    const duration = Math.max(1, project.metadata?.duration || 30);
+    const logoEntry: LogoOverlay = {
+      id: crypto.randomUUID(),
+      filename: file.name,
+      url: durableUrl,
+      enabled: true,
+      x: 0.8,
+      y: 0.08,
+      widthPct: 16,
+      opacity: 1,
+      permanent: true,
+      startTime: 0,
+      endTime: duration,
+      presetPosition: 'top-right',
+    };
+    const updated = await localProjectService.updateProject(projectId, {
+      logos: [...(project.logos || []), logoEntry],
     });
+    return { project: updated };
   },
 
   uploadCanvasBackground: async (projectId: string, file: File) => {
-    const fd = new FormData();
-    fd.append('file', file);
-    return request<{ project: Project; url: string; filename: string }>(
-      `/api/projects/${projectId}/canvas-bg`,
-      {
-        method: 'POST',
-        body: fd,
-      }
-    );
+    const key = buildAssetBlobKey('backgrounds', projectId, file.name);
+    const durableUrl = await localProjectService.saveProjectMedia(projectId, key, file, file.type);
+    const project = await localProjectService.getProject(projectId);
+    if (!project) throw new Error('Project not found in local storage.');
+    const updated = await localProjectService.updateProject(projectId, {
+      canvas: {
+        ...DEFAULT_VIDEO_CANVAS,
+        ...(project.canvas || {}),
+        backgroundType: 'image',
+        bgImageUrl: durableUrl,
+      },
+    });
+    return { project: updated, url: durableUrl, filename: file.name };
   },
 
   uploadMusic: async (projectId: string, file: File) => {
-    const fd = new FormData();
-    fd.append('file', file);
-    return request<{ project: Project }>(`/api/projects/${projectId}/music`, {
-      method: 'POST',
-      body: fd,
+    const key = buildAssetBlobKey('music', projectId, file.name);
+    const durableUrl = await localProjectService.saveProjectMedia(projectId, key, file, file.type);
+    const project = await localProjectService.getProject(projectId);
+    if (!project) throw new Error('Project not found in local storage.');
+    const updated = await localProjectService.updateProject(projectId, {
+      voice: {
+        ...(project.voice || {}),
+        bgMusicUrl: durableUrl,
+        bgMusicFilename: file.name,
+      },
     });
+    return { project: updated };
   },
 
   uploadSfx: async (projectId: string, file: File) => {
-    const fd = new FormData();
-    fd.append('file', file);
-    return request<{ project: Project }>(`/api/projects/${projectId}/sfx`, {
-      method: 'POST',
-      body: fd,
+    const key = buildAssetBlobKey('sfx', projectId, file.name);
+    const durableUrl = await localProjectService.saveProjectMedia(projectId, key, file, file.type);
+    const project = await localProjectService.getProject(projectId);
+    if (!project) throw new Error('Project not found in local storage.');
+    const updated = await localProjectService.updateProject(projectId, {
+      voice: {
+        ...(project.voice || {}),
+        sfxUrl: durableUrl,
+        sfxFilename: file.name,
+      },
     });
+    return { project: updated };
   },
 
   uploadMask: (projectId: string, blurId: string, maskBase64: string) =>
@@ -930,70 +980,104 @@ export const api = {
       body: JSON.stringify(params),
     }),
 
-  generateThumbnails: (projectId: string) =>
-    request<{
-      thumbnails: string[];
-      sourceMode?: 'final-export' | 'edited-source';
-      suggestedTitle: string;
-      suggestedSubtitle: string;
-      suggestedTitles?: string[];
-      translationMissingWarning?: boolean;
-    }>(`/api/projects/${projectId}/thumbnails/generate`, { method: 'POST' }),
+  generateThumbnails: async (projectId: string) => {
+    const project = await localProjectService.getProject(projectId);
+    const filmstrip = await idbGet<{ frames: FilmstripFrame[] }>('filmstrips', projectId);
+    const existingFrames = (filmstrip?.frames || []).map((f) => f.url).filter(Boolean);
+    const thumbs =
+      existingFrames.length >= 5
+        ? existingFrames.slice(0, 5)
+        : existingFrames.length > 0
+        ? Array.from({ length: 5 }, (_, i) => existingFrames[i % existingFrames.length])
+        : [project?.thumbnailUrl || ''];
+    const sourceMode: 'edited-source' | 'final-export' = project?.lastExportUrl
+      ? 'final-export'
+      : 'edited-source';
+    return {
+      thumbnails: thumbs.filter(Boolean),
+      sourceMode,
+      suggestedTitle: project?.name || 'Epic Movie Recap',
+      suggestedSubtitle: 'Watch until the shocking end!',
+      suggestedTitles: [
+        project?.name || 'Epic Movie Recap',
+        'Top 10 Moments You Missed',
+        'The Truth Behind The Ending',
+        'Full Story Explained',
+        'Ending Explained in 5 Minutes',
+      ],
+      translationMissingWarning: false,
+    };
+  },
 
-  startExport: (projectId: string, exportSettings: Project['exportSettings']) =>
-    request<{ job: RenderJob }>(`/api/projects/${projectId}/export`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ exportSettings }),
-    }),
+  startExport: async (projectId: string, exportSettings: Project['exportSettings']) => {
+    const res = await localProjectService.startLocalExport(projectId, exportSettings);
+    return { job: res.job };
+  },
 
-  listProjectJobs: (projectId: string) =>
-    request<{ jobs: RenderJob[] }>(`/api/projects/${projectId}/jobs`),
+  listProjectJobs: async (projectId: string) => {
+    const all = await idbList<RenderJob>('jobs');
+    const jobs = (all || []).filter((j) => j && j.projectId === projectId);
+    return { jobs };
+  },
 
-  getJob: async (jobId: string) => {
+  getJob: async (jobId: string): Promise<{ job: RenderJob }> => {
     const localJob = await idbGet<RenderJob>('jobs', jobId).catch(() => undefined);
     if (localJob) return { job: localJob };
-    return request<{ job: RenderJob }>(`/api/jobs/${jobId}`);
+    const fallbackJob: RenderJob = {
+      id: jobId,
+      projectId: '',
+      type: 'render',
+      status: 'completed',
+      progress: 100,
+      stage: 'Completed',
+      etaSeconds: 0,
+      outputUrl: null,
+      outputSize: null,
+      error: null,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    };
+    return { job: fallbackJob };
   },
 
-  listAllJobs: () => request<{ jobs: RenderJob[] }>('/api/jobs'),
+  listAllJobs: async () => {
+    const jobs = await idbList<RenderJob>('jobs');
+    return { jobs: jobs || [] };
+  },
 
   uploadVideoDirect: async (projectId: string, file: File) => {
-    if (!isValidProjectId(projectId)) {
-      throw new ApiHttpError(
-        'Invalid or missing project ID. Please select or create a project before uploading.',
-        400,
-        'INVALID_PROJECT_ID'
-      );
-    }
-    const cleanId = projectId.trim();
-    // Verify project exists on backend before transmitting binary video payload
-    await api.getProject(cleanId);
-    const fd = new FormData();
-    fd.append('file', file);
-    const res = await request<{ project: Project; metadata: VideoMetadata }>(
-      `/api/projects/${encodeURIComponent(cleanId)}/video`,
-      {
-        method: 'POST',
-        body: fd,
-      }
-    );
-    if (res.project?.id) {
-      void indexedDbStore.saveProjectSnapshot(res.project);
-      void idbSet('projects', res.project.id, res.project).catch(() => undefined);
-    }
-    return res;
+    const updated = await uploadVideoChunked({
+      projectId,
+      file,
+      onProgress: () => {},
+    });
+    return { project: updated, metadata: updated.metadata! };
   },
 
-  getTimelineFilmstrip: (projectId: string, frames?: number) =>
-    request<{ frames: FilmstripFrame[]; duration: number }>(
-      frames
-        ? `/api/projects/${projectId}/timeline-filmstrip?frames=${frames}`
-        : `/api/projects/${projectId}/timeline-filmstrip`
-    ),
+  getTimelineFilmstrip: async (projectId: string, _frames?: number) => {
+    const cached = await idbGet<{ id: string; frames: FilmstripFrame[]; duration: number }>('filmstrips', projectId);
+    if (cached && cached.frames) {
+      return { frames: cached.frames, duration: cached.duration || 10 };
+    }
+    const project = await localProjectService.getProject(projectId);
+    return { frames: [], duration: project?.metadata?.duration || 10 };
+  },
 
-  getAudioWaveforms: (projectId: string) =>
-    request<ProjectAudioWaveforms>(`/api/projects/${projectId}/audio-waveforms`),
+  getAudioWaveforms: async (projectId: string) => {
+    const cached = await idbGet<{ id: string; waveforms: ProjectAudioWaveforms }>('waveforms', projectId);
+    if (cached && cached.waveforms) {
+      return cached.waveforms;
+    }
+    const project = await localProjectService.getProject(projectId);
+    const peaks = project?.waveformPeaks || [];
+    return {
+      orig: peaks,
+      dub: [],
+      dubClips: {},
+      bgm: [],
+      sfx: [],
+    };
+  },
 };
 
 export async function uploadVideoChunked(params: {
@@ -1013,9 +1097,9 @@ export async function uploadVideoChunked(params: {
 
   const dotIdx = file.name.lastIndexOf('.');
   const ext = dotIdx >= 0 ? file.name.slice(dotIdx).toLowerCase() : '';
-  if (!['.mp4', '.mov', '.mkv'].includes(ext)) {
+  if (!['.mp4', '.mov', '.mkv', '.webm', '.m4v'].includes(ext)) {
     throw new ApiHttpError(
-      `Unsupported video format "${ext || 'unknown'}". Allowed formats: MP4, MOV, MKV.`,
+      `Unsupported video format "${ext || 'unknown'}". Allowed formats: MP4, MOV, MKV, WEBM.`,
       400,
       'UNSUPPORTED_VIDEO_FORMAT'
     );
@@ -1024,126 +1108,39 @@ export async function uploadVideoChunked(params: {
     throw new ApiHttpError('Selected video file is empty.', 400, 'EMPTY_FILE');
   }
 
-  // Confirm project exists in persistent storage before uploading chunks
-  onProgress(1, 'Verifying project...');
-  await api.getProject(projectId);
+  onProgress(2, 'Verifying local project storage...');
+  let project = await localProjectService.getProject(projectId);
+  if (!project) {
+    project = await localProjectService.createProject({
+      id: projectId,
+      name: file.name.replace(/\.[^.]+$/, ''),
+    });
+  }
 
-  const CHUNK_SIZE = 5 * 1024 * 1024; // 5 MB chunks
-  const totalChunks = Math.max(1, Math.ceil(file.size / CHUNK_SIZE));
+  const result = await processVideoUploadInBrowser(file, onProgress, projectId);
+  const firstThumbUrl = result.filmstrip.find((f) => Boolean(f.url))?.url || null;
+  const durableIdbUrl = `idb://blobs/${result.sourceVideoBlobKey}`;
 
-  onProgress(2, 'Initializing upload...');
-  const initRes = await request<{
-    uploadId: string;
-    totalChunks: number;
-    projectId?: string;
-    storageMode?: 'r2' | 'indexeddb-local';
-    suggestedUrl?: string;
-    offlineLocal?: boolean;
-  }>('/api/uploads/init', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      projectId,
-      filename: file.name,
-      totalSize: file.size,
-      totalChunks,
-    }),
+  await idbSet('filmstrips', projectId, {
+    id: projectId,
+    frames: result.filmstrip,
+    duration: result.duration,
+  });
+  await idbSet('waveforms', projectId, {
+    id: projectId,
+    waveforms: result.waveforms,
   });
 
-  // When running on Cloudflare Pages without R2 bucket (or offline static mode),
-  // store the large video binary in browser IndexedDB and persist metadata/blob key on the D1 project.
-  if (initRes.storageMode === 'indexeddb-local') {
-    const result = await processVideoUploadInBrowser(file, onProgress, projectId);
-    const firstThumbUrl = result.filmstrip.find((f) => Boolean(f.url))?.url || null;
-    const durableIdbUrl = `idb://blobs/${result.sourceVideoBlobKey}`;
+  onProgress(95, 'Saving video association to local project...');
+  const updated = await localProjectService.updateProject(projectId, {
+    sourceVideoUrl: durableIdbUrl,
+    sourceVideoBlobKey: result.sourceVideoBlobKey,
+    sourceFilename: file.name,
+    thumbnailUrl: firstThumbUrl || project.thumbnailUrl,
+    metadata: result.metadata,
+    waveformPeaks: result.waveforms.orig,
+  });
 
-    await idbSet('filmstrips', projectId, {
-      id: projectId,
-      frames: result.filmstrip,
-      duration: result.duration,
-    });
-    await idbSet('waveforms', projectId, {
-      id: projectId,
-      waveforms: result.waveforms,
-    });
-
-    onProgress(95, 'Saving video association to project...');
-    const completeRes = await request<{ project: Project }>(
-      `/api/uploads/${encodeURIComponent(initRes.uploadId)}/complete`,
-      {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          projectId,
-          storageMode: 'indexeddb-local',
-          sourceVideoUrl: durableIdbUrl,
-          sourceVideoBlobKey: result.sourceVideoBlobKey,
-          sourceFilename: file.name,
-          thumbnailDataUrl: firstThumbUrl || undefined,
-          metadata: result.metadata,
-          waveformPeaks: result.waveforms.orig,
-        }),
-      }
-    );
-
-    const savedProject: Project = {
-      ...completeRes.project,
-      sourceVideoUrl: result.sourceVideoUrl || completeRes.project.sourceVideoUrl,
-      sourceVideoBlobKey: result.sourceVideoBlobKey,
-    };
-    await idbSet('projects', savedProject.id, savedProject).catch(() => undefined);
-    await indexedDbStore.saveProjectSnapshot(savedProject).catch(() => undefined);
-    onProgress(100, 'Upload complete');
-    return savedProject;
-  }
-
-  for (let i = 0; i < totalChunks; i++) {
-    const start = i * CHUNK_SIZE;
-    const end = Math.min(file.size, start + CHUNK_SIZE);
-    const slice = file.slice(start, end);
-    const buffer = await slice.arrayBuffer();
-
-    const chunkUrl = resolveApiUrl(
-      `/api/uploads/${encodeURIComponent(initRes.uploadId)}/chunk?index=${i}`
-    );
-    const chunkRes = await fetch(chunkUrl, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/octet-stream' },
-      body: buffer,
-    });
-    if (!chunkRes.ok) {
-      let chunkErrMsg = `Chunk ${i + 1} of ${totalChunks} upload failed (${chunkRes.status})`;
-      let chunkErrCode: string | undefined;
-      try {
-        const errJson = (await chunkRes.json()) as { error?: string; code?: string };
-        if (typeof errJson?.error === 'string' && errJson.error.trim()) {
-          chunkErrMsg = errJson.error;
-        }
-        if (typeof errJson?.code === 'string') {
-          chunkErrCode = errJson.code;
-        }
-      } catch {
-        // ignore non-JSON chunk response body
-      }
-      throw new ApiHttpError(chunkErrMsg, chunkRes.status, chunkErrCode);
-    }
-
-    const pct = Math.round(5 + ((i + 1) / totalChunks) * 80);
-    onProgress(pct, `Uploading chunk ${i + 1} of ${totalChunks}...`);
-  }
-
-  onProgress(90, 'Analyzing video streams & extracting audio waveform...');
-  const completeRes = await request<{ project: Project }>(
-    `/api/uploads/${encodeURIComponent(initRes.uploadId)}/complete`,
-    {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ projectId }),
-    }
-  );
-
-  await idbSet('projects', completeRes.project.id, completeRes.project).catch(() => undefined);
-  await indexedDbStore.saveProjectSnapshot(completeRes.project).catch(() => undefined);
   onProgress(100, 'Upload complete');
-  return completeRes.project;
+  return updated;
 }

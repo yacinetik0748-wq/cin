@@ -12,6 +12,7 @@ import {
   normalizeSyncMode,
 } from '../../server/services/timeline_sync_service';
 import { idbGet, idbSet, retrieveProjectVideoBlob, storeBlobAsset } from './browserStorage';
+import { localProjectService } from './localProjectService';
 import { distributeWordsEvenly } from './workflowStages';
 import {
   DEFAULT_FISH_API_BASE,
@@ -51,21 +52,9 @@ function collectSafeHeaders(headers: Headers): Record<string, string> {
 }
 
 export async function ensureLocalProject(projectId: string): Promise<Project> {
-  const local = await idbGet<Project>('projects', projectId);
+  const local = await localProjectService.getProject(projectId);
   if (local) return local;
-  try {
-    const res = await fetch(`/api/projects/${encodeURIComponent(projectId)}`);
-    if (res.ok) {
-      const data = (await res.json()) as { project?: Project };
-      if (data.project) {
-        await idbSet('projects', projectId, data.project);
-        return data.project;
-      }
-    }
-  } catch {
-    // ignore remote fetch failure in offline/static mode
-  }
-  throw new Error('Project not found in local storage.');
+  throw new Error('Project not found in local IndexedDB storage.');
 }
 
 async function syncProjectRemoteBestEffort(
@@ -73,13 +62,9 @@ async function syncProjectRemoteBestEffort(
   patch: Partial<Pick<Project, 'captions' | 'translation' | 'voice' | 'workflow'>>
 ): Promise<void> {
   try {
-    await fetch(`/api/projects/${encodeURIComponent(projectId)}`, {
-      method: 'PATCH',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(patch),
-    });
+    await localProjectService.updateProject(projectId, patch);
   } catch {
-    // static / offline mode — IndexedDB is the source of truth
+    // IndexedDB is the single local source of truth
   }
 }
 

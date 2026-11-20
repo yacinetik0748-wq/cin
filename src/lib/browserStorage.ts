@@ -2,7 +2,7 @@ import { Project, StudioPreset, DefaultStudioPreferences, SavedFishVoice, SavedF
 import { indexedDbStore } from './indexedDbStore';
 
 export const DB_NAME = 'recap_studio_local_db';
-export const CURRENT_SCHEMA_VERSION = 6;
+export const CURRENT_SCHEMA_VERSION = 7;
 
 export const REQUIRED_STORES: Record<string, { keyPath: string }> = {
   projects: { keyPath: 'id' },
@@ -15,6 +15,9 @@ export const REQUIRED_STORES: Record<string, { keyPath: string }> = {
   fonts: { keyPath: 'id' },
   waveforms: { keyPath: 'id' },
   appSettings: { keyPath: 'key' },
+  mediaCache: { keyPath: 'sha256' },
+  pendingSync: { keyPath: 'projectId' },
+  kv: { keyPath: 'key' },
 };
 
 let cachedDb: IDBDatabase | null = null;

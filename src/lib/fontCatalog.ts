@@ -1,6 +1,7 @@
 export * from './fontCatalogData.ts';
 import { BUILTIN_FONT_CATALOG, FontStatusEntry, resolveClosestSupportedWeight } from './fontCatalogData.ts';
-import { getBlobAssetUrl } from './browserStorage.ts';
+import { getBlobAssetUrl, idbList } from './browserStorage.ts';
+import type { SavedFontAsset } from '../types/studio.ts';
 
 // Runtime browser FontFace registry so we NEVER pretend an unloaded font succeeded
 const statusCache = new Map<string, FontStatusEntry>();
@@ -76,27 +77,17 @@ export async function ensureFontLoaded(params: {
       let source: FontStatusEntry['source'] = customUrl ? 'custom' : 'builtin';
 
       if (!fontUrl) {
-        // Ask server/edge to resolve real TTF file for both browser + FFmpeg libass
         try {
-          const resp = await fetch(
-            `/api/fonts/ensure?family=${encodeURIComponent(cleanFamily)}&weight=${resolvedWeight}&italic=${italic ? '1' : '0'}`
+          const customFonts = await idbList<SavedFontAsset>('fonts');
+          const customMatch = (customFonts || []).find(
+            (f) => f.family.toLowerCase() === cleanFamily.toLowerCase()
           );
-          const contentType = resp.headers.get('Content-Type') || '';
-          if (contentType.includes('application/json')) {
-            const data = (await resp.json()) as {
-              available?: boolean;
-              url?: string;
-              error?: string;
-              source?: 'builtin' | 'custom' | 'system';
-              resolvedWeight?: number;
-            };
-            if (resp.ok && data.available && data.url) {
-              fontUrl = data.url;
-              source = data.source || 'builtin';
-            }
+          if (customMatch?.url) {
+            fontUrl = customMatch.url;
+            source = 'custom';
           }
         } catch {
-          // Offline or no API route: fall through to Google Fonts CSS check
+          // ignore IDB read failure and fall through to Google Fonts CSS
         }
 
         if (!fontUrl) {

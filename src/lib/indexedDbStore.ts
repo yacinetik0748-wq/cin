@@ -1,7 +1,7 @@
 import { PendingSyncOp, Project, SupabaseFreeConfig } from '../types/studio';
 
-const DB_NAME = 'recap_studio_free_cache';
-const DB_VERSION = 1;
+const DB_NAME = 'recap_studio_local_db';
+const DB_VERSION = 7;
 
 export interface CachedMediaEntry {
   sha256: string;
