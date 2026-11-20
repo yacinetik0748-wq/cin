@@ -33,6 +33,7 @@ import {
   uploadVideoChunked,
 } from '../lib/api';
 import { formatBytes, formatDurationShort } from '../lib/formatters';
+import { resolvePlayableAssetUrl } from '../lib/supabaseCloud';
 import {
   StudioBanner,
   StudioButton,
@@ -80,6 +81,11 @@ export function MediaLibraryPage({
   const [uploadProgress, setUploadProgress] = useState<{ pct: number; stage: string } | null>(null);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [statusMsg, setStatusMsg] = useState<string | null>(null);
+  const [resolvedAudioUrls, setResolvedAudioUrls] = useState<{
+    dub: string | null;
+    bgm: string | null;
+    sfx: string | null;
+  }>({ dub: null, bgm: null, sfx: null });
 
   const loadManifest = useCallback(async () => {
     setLoadingManifest(true);
@@ -98,6 +104,20 @@ export function MediaLibraryPage({
   useEffect(() => {
     void loadManifest();
   }, [loadManifest, project.updatedAt]);
+
+  useEffect(() => {
+    let active = true;
+    void Promise.all([
+      resolvePlayableAssetUrl(project.voice.fullDubUrl || null, project.cloudAssets),
+      resolvePlayableAssetUrl(project.voice.bgMusicUrl || null, project.cloudAssets),
+      resolvePlayableAssetUrl(project.voice.sfxUrl || null, project.cloudAssets),
+    ]).then(([dub, bgm, sfx]) => {
+      if (active) setResolvedAudioUrls({ dub, bgm, sfx });
+    });
+    return () => {
+      active = false;
+    };
+  }, [project.voice.fullDubUrl, project.voice.bgMusicUrl, project.voice.sfxUrl, project.cloudAssets]);
 
   const handleCompressSource = async (
     preset: 'under-45mb' | '720p-compact' | '480p-compact'
@@ -567,7 +587,7 @@ export function MediaLibraryPage({
               </p>
               {project.voice.fullDubUrl ? (
                 <audio
-                  src={resolveApiUrl(project.voice.fullDubUrl)}
+                  src={resolvedAudioUrls.dub || resolveApiUrl(project.voice.fullDubUrl)}
                   controls
                   className="w-full h-8"
                 />
@@ -587,7 +607,7 @@ export function MediaLibraryPage({
                     {project.voice.bgMusicFilename || 'Music track'}
                   </div>
                   <audio
-                    src={resolveApiUrl(project.voice.bgMusicUrl)}
+                    src={resolvedAudioUrls.bgm || resolveApiUrl(project.voice.bgMusicUrl)}
                     controls
                     className="w-full h-8"
                   />
@@ -608,7 +628,7 @@ export function MediaLibraryPage({
                     {project.voice.sfxFilename || 'SFX clip'}
                   </div>
                   <audio
-                    src={resolveApiUrl(project.voice.sfxUrl)}
+                    src={resolvedAudioUrls.sfx || resolveApiUrl(project.voice.sfxUrl)}
                     controls
                     className="w-full h-8"
                   />

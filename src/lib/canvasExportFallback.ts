@@ -4,6 +4,8 @@ import {
 } from '../types/studio';
 import { resolveCanvasDimensions } from './workflowStages';
 import { retrieveProjectVideoBlob, getBlobAssetByKey } from './browserStorage';
+import { isOrigAudioActive } from './clientExportRenderer';
+import { resolveMediaBlob } from './clientMediaEngine';
 import { getEffectiveVideoClips } from './videoTimeline';
 
 export interface CanvasExportResult {
@@ -70,9 +72,13 @@ async function loadImageFromAssetUrl(url: string): Promise<HTMLImageElement | nu
 
 export async function renderProjectCanvasFallback(params: {
   project: Project;
-  onProgress: (pct: number, stage: string) => void;
+  onProgress: (pct: number, stage: string, etaSec?: number | null) => void;
+  signal?: AbortSignal;
 }): Promise<CanvasExportResult> {
-  const { project, onProgress } = params;
+  const { project, onProgress, signal } = params;
+  if (signal?.aborted) {
+    throw new DOMException('Export cancelled by user.', 'AbortError');
+  }
 
   if (typeof MediaRecorder === 'undefined') {
     throw new Error('MediaRecorder API is not available in this browser.');
@@ -159,6 +165,11 @@ export async function renderProjectCanvasFallback(params: {
   let audioDest: MediaStreamAudioDestinationNode | null = null;
   let dubAudioEl: HTMLAudioElement | null = null;
   let dubUrl: string | null = null;
+  let bgmAudioEl: HTMLAudioElement | null = null;
+  let bgmUrl: string | null = null;
+  let sfxAudioEl: HTMLAudioElement | null = null;
+  let sfxUrl: string | null = null;
+  const scheduledSources: AudioBufferSourceNode[] = [];
 
   try {
     if (AudioContextClass) {
@@ -168,35 +179,123 @@ export async function renderProjectCanvasFallback(params: {
       }
       audioDest = audioCtx.createMediaStreamDestination();
 
+      const origActive = isOrigAudioActive(project.voice);
       try {
         const vidSource = audioCtx.createMediaElementSource(video);
         const vidGain = audioCtx.createGain();
-        vidGain.gain.value = project.voice.preserveOriginalAudio
-          ? project.voice.originalAudioVolume ?? 0.3
-          : exportSettings.applyDubbing && project.voice.enabled
-          ? 0
-          : 1.0;
+        vidGain.gain.value = origActive
+          ? Math.max(0, Math.min(2.0, Number(project.voice.originalAudioVolume ?? 1.0)))
+          : 0;
         vidSource.connect(vidGain);
         vidGain.connect(audioDest);
+        if (!origActive) {
+          video.muted = true;
+        }
       } catch {
-        // media element source unavailable
+        if (!origActive) video.muted = true;
       }
 
-      if (exportSettings.applyDubbing && project.voice.enabled && project.voice.fullDubUrl) {
-        let dubBlob: Blob | null = null;
-        if (project.voice.fullDubUrl.startsWith('idb://blobs/')) {
-          dubBlob = await getBlobAssetByKey(project.voice.fullDubUrl.slice('idb://blobs/'.length));
-        }
-        if (dubBlob) {
+      const voiceVol = Math.max(0, Math.min(2.0, Number(project.voice.voiceVolume ?? 1.0)));
+      const dubEnabled = Boolean(
+        exportSettings.applyDubbing &&
+          project.voice.enabled &&
+          !project.voice.voiceMuted &&
+          voiceVol > 0.005
+      );
+
+      if (dubEnabled && project.voice.fullDubUrl) {
+        const dubBlob = await resolveMediaBlob(project.voice.fullDubUrl).catch(() => null);
+        if (dubBlob && dubBlob.size > 0) {
           dubUrl = URL.createObjectURL(dubBlob);
           dubAudioEl = new Audio(dubUrl);
           dubAudioEl.crossOrigin = 'anonymous';
+          dubAudioEl.playbackRate = Math.max(0.25, Math.min(4.0, Number(project.voice.speakingSpeed || 1.0)));
           try {
             const dubSource = audioCtx.createMediaElementSource(dubAudioEl);
             const dubGain = audioCtx.createGain();
-            dubGain.gain.value = project.voice.voiceVolume ?? 1.0;
+            dubGain.gain.value = voiceVol;
             dubSource.connect(dubGain);
             dubGain.connect(audioDest);
+          } catch {
+            // ignore
+          }
+        }
+      } else if (dubEnabled && (project.voice.generatedClips || []).length > 0) {
+        const dubGain = audioCtx.createGain();
+        dubGain.gain.value = voiceVol;
+        dubGain.connect(audioDest);
+        const offsetSec = Number(project.voice.timingOffsetSec || 0);
+        const baseWhen = audioCtx.currentTime;
+        for (const clip of project.voice.generatedClips) {
+          if (!clip.audioUrl) continue;
+          const clipBlob = await resolveMediaBlob(clip.audioUrl).catch(() => null);
+          if (!clipBlob || clipBlob.size === 0) continue;
+          try {
+            const ab = await clipBlob.arrayBuffer();
+            const buf = await audioCtx.decodeAudioData(ab.slice(0));
+            const src = audioCtx.createBufferSource();
+            src.buffer = buf;
+            src.playbackRate.value = Math.max(
+              0.25,
+              Math.min(4.0, (clip.speed ?? 1.0) * (project.voice.speakingSpeed ?? 1.0))
+            );
+            src.connect(dubGain);
+            const startAt = Math.max(0, Number(clip.start || 0) + offsetSec);
+            src.start(baseWhen + startAt, Math.max(0, Number(clip.trimStartSec ?? 0)));
+            scheduledSources.push(src);
+          } catch {
+            // ignore undecodable clip
+          }
+        }
+      }
+
+      const bgmVol = Math.max(0, Math.min(2.0, Number(project.voice.bgMusicVolume ?? 0)));
+      const bgmEnabled =
+        exportSettings.applyAudioMix &&
+        (project.voice.bgMusicEnabled !== undefined
+          ? Boolean(project.voice.bgMusicEnabled)
+          : Boolean(project.voice.bgMusicUrl && bgmVol > 0.005)) &&
+        !project.voice.bgMusicMuted &&
+        bgmVol > 0.005;
+
+      if (bgmEnabled && project.voice.bgMusicUrl) {
+        const bgmBlob = await resolveMediaBlob(project.voice.bgMusicUrl).catch(() => null);
+        if (bgmBlob && bgmBlob.size > 0) {
+          bgmUrl = URL.createObjectURL(bgmBlob);
+          bgmAudioEl = new Audio(bgmUrl);
+          bgmAudioEl.crossOrigin = 'anonymous';
+          bgmAudioEl.loop = true;
+          try {
+            const bgmSrc = audioCtx.createMediaElementSource(bgmAudioEl);
+            const bgmGain = audioCtx.createGain();
+            bgmGain.gain.value = bgmVol;
+            bgmSrc.connect(bgmGain);
+            bgmGain.connect(audioDest);
+          } catch {
+            // ignore
+          }
+        }
+      }
+
+      const sfxVol = Math.max(0, Math.min(2.0, Number(project.voice.sfxVolume ?? 1.0)));
+      const sfxEnabled =
+        exportSettings.applyAudioMix &&
+        Boolean(project.voice.sfxEnabled) &&
+        !project.voice.sfxMuted &&
+        sfxVol > 0.005;
+
+      if (sfxEnabled && project.voice.sfxUrl) {
+        const sfxBlob = await resolveMediaBlob(project.voice.sfxUrl).catch(() => null);
+        if (sfxBlob && sfxBlob.size > 0) {
+          sfxUrl = URL.createObjectURL(sfxBlob);
+          sfxAudioEl = new Audio(sfxUrl);
+          sfxAudioEl.crossOrigin = 'anonymous';
+          try {
+            const sfxSrc = audioCtx.createMediaElementSource(sfxAudioEl);
+            const sfxGain = audioCtx.createGain();
+            sfxGain.gain.value = sfxVol;
+            sfxSrc.connect(sfxGain);
+            sfxGain.connect(audioDest);
           } catch {
             // ignore
           }
@@ -249,9 +348,22 @@ export async function renderProjectCanvasFallback(params: {
       cancelAnimationFrame(animId);
       URL.revokeObjectURL(videoUrl);
       if (dubUrl) URL.revokeObjectURL(dubUrl);
+      if (bgmUrl) URL.revokeObjectURL(bgmUrl);
+      if (sfxUrl) URL.revokeObjectURL(sfxUrl);
+      for (const s of scheduledSources) {
+        try { s.stop(); } catch { /* ignore */ }
+      }
       if (dubAudioEl) {
         dubAudioEl.pause();
         dubAudioEl.src = '';
+      }
+      if (bgmAudioEl) {
+        bgmAudioEl.pause();
+        bgmAudioEl.src = '';
+      }
+      if (sfxAudioEl) {
+        sfxAudioEl.pause();
+        sfxAudioEl.src = '';
       }
       if (audioCtx && audioCtx.state !== 'closed') {
         audioCtx.close().catch(() => {});
@@ -259,6 +371,15 @@ export async function renderProjectCanvasFallback(params: {
       video.pause();
       video.src = '';
     };
+
+    const onAbort = () => {
+      if (recorder.state === 'recording') {
+        try { recorder.stop(); } catch { /* ignore */ }
+      }
+      cleanup();
+      reject(new DOMException('Export cancelled by user.', 'AbortError'));
+    };
+    signal?.addEventListener('abort', onAbort, { once: true });
 
     recorder.onerror = (err) => {
       cleanup();
@@ -432,8 +553,26 @@ export async function renderProjectCanvasFallback(params: {
         await video.play();
       }
       if (dubAudioEl) {
-        dubAudioEl.currentTime = 0;
-        dubAudioEl.play().catch(() => {});
+        const offsetSec = Number(project.voice.timingOffsetSec || 0);
+        if (offsetSec > 0.05) {
+          setTimeout(() => {
+            if (!stopped && dubAudioEl) {
+              dubAudioEl.currentTime = 0;
+              dubAudioEl.play().catch(() => {});
+            }
+          }, Math.round(offsetSec * 1000));
+        } else {
+          dubAudioEl.currentTime = Math.max(0, -offsetSec);
+          dubAudioEl.play().catch(() => {});
+        }
+      }
+      if (bgmAudioEl) {
+        bgmAudioEl.currentTime = 0;
+        bgmAudioEl.play().catch(() => {});
+      }
+      if (sfxAudioEl) {
+        sfxAudioEl.currentTime = 0;
+        sfxAudioEl.play().catch(() => {});
       }
       animId = requestAnimationFrame(drawFrame);
     };

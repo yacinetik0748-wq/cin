@@ -22,14 +22,71 @@ import {
 import { getBlobAssetByKey } from './browserStorage';
 import { indexedDbStore } from './indexedDbStore';
 
-const CORE_CDN_BASES = [
+const FFMPEG_CACHE_NAME = 'recap-ffmpeg-core-cache-v1';
+
+const CORE_ST_CDN_BASES = [
   'https://cdn.jsdelivr.net/npm/@ffmpeg/core@0.12.6/dist/esm',
   'https://unpkg.com/@ffmpeg/core@0.12.6/dist/esm',
+];
+
+const CORE_MT_CDN_BASES = [
+  'https://cdn.jsdelivr.net/npm/@ffmpeg/core-mt@0.12.6/dist/esm',
+  'https://unpkg.com/@ffmpeg/core-mt@0.12.6/dist/esm',
 ];
 
 let ffmpegInstance: FFmpeg | null = null;
 let ffmpegLoadingPromise: Promise<FFmpeg> | null = null;
 let ffmpegQueue: Promise<unknown> = Promise.resolve();
+let ffmpegMultiThreaded = false;
+const cachedObjectCoreUrls = new Map<string, string>();
+
+export function supportsFFmpegMultiThread(): boolean {
+  return (
+    typeof SharedArrayBuffer !== 'undefined' &&
+    typeof globalThis !== 'undefined' &&
+    Boolean((globalThis as { crossOriginIsolated?: boolean }).crossOriginIsolated)
+  );
+}
+
+export function isBrowserFFmpegMultiThreaded(): boolean {
+  return ffmpegMultiThreaded;
+}
+
+async function fetchCoreAssetAsBlobUrl(url: string, mimeType: string): Promise<string> {
+  const memCached = cachedObjectCoreUrls.get(url);
+  if (memCached) return memCached;
+
+  let blob: Blob | null = null;
+  if (typeof caches !== 'undefined') {
+    try {
+      const cache = await caches.open(FFMPEG_CACHE_NAME);
+      const cachedResp = await cache.match(url);
+      if (cachedResp && cachedResp.ok) {
+        const buf = await cachedResp.arrayBuffer();
+        if (buf.byteLength > 0) {
+          blob = new Blob([buf], { type: mimeType });
+        }
+      }
+      if (!blob) {
+        const netResp = await fetch(url);
+        if (netResp.ok) {
+          const clone = netResp.clone();
+          const buf = await netResp.arrayBuffer();
+          if (buf.byteLength > 0) {
+            void cache.put(url, clone).catch(() => {});
+            blob = new Blob([buf], { type: mimeType });
+          }
+        }
+      }
+    } catch {
+      // Fallback cleanly to toBlobURL if Cache API is restricted
+    }
+  }
+
+  const blobUrl = blob ? URL.createObjectURL(blob) : await toBlobURL(url, mimeType);
+  cachedObjectCoreUrls.set(url, blobUrl);
+  return blobUrl;
+}
 
 export async function getBrowserFFmpeg(
   onLog?: (msg: string) => void
@@ -39,18 +96,40 @@ export async function getBrowserFFmpeg(
   }
   if (!ffmpegLoadingPromise) {
     ffmpegLoadingPromise = (async () => {
-      const ff = new FFmpeg();
+      const canMt = supportsFFmpegMultiThread();
+      const attempts: Array<{ base: string; mt: boolean }> = [
+        ...(canMt ? CORE_MT_CDN_BASES.map((base) => ({ base, mt: true })) : []),
+        ...CORE_ST_CDN_BASES.map((base) => ({ base, mt: false })),
+      ];
+
       let lastErr: unknown = null;
-      for (const base of CORE_CDN_BASES) {
+      for (const attempt of attempts) {
+        const ff = new FFmpeg();
         try {
-          const [coreURL, wasmURL] = await Promise.all([
-            toBlobURL(`${base}/ffmpeg-core.js`, 'text/javascript'),
-            toBlobURL(`${base}/ffmpeg-core.wasm`, 'application/wasm'),
-          ]);
-          await ff.load({ coreURL, wasmURL });
+          if (attempt.mt) {
+            const [coreURL, wasmURL, workerURL] = await Promise.all([
+              fetchCoreAssetAsBlobUrl(`${attempt.base}/ffmpeg-core.js`, 'text/javascript'),
+              fetchCoreAssetAsBlobUrl(`${attempt.base}/ffmpeg-core.wasm`, 'application/wasm'),
+              fetchCoreAssetAsBlobUrl(`${attempt.base}/ffmpeg-core.worker.js`, 'text/javascript'),
+            ]);
+            await ff.load({ coreURL, wasmURL, workerURL });
+            ffmpegMultiThreaded = true;
+          } else {
+            const [coreURL, wasmURL] = await Promise.all([
+              fetchCoreAssetAsBlobUrl(`${attempt.base}/ffmpeg-core.js`, 'text/javascript'),
+              fetchCoreAssetAsBlobUrl(`${attempt.base}/ffmpeg-core.wasm`, 'application/wasm'),
+            ]);
+            await ff.load({ coreURL, wasmURL });
+            ffmpegMultiThreaded = false;
+          }
           ffmpegInstance = ff;
           return ff;
         } catch (err) {
+          try {
+            ff.terminate();
+          } catch {
+            // ignore
+          }
           lastErr = err;
         }
       }
@@ -69,6 +148,20 @@ export async function getBrowserFFmpeg(
   return ff;
 }
 
+export function terminateBrowserFFmpeg(): void {
+  if (ffmpegInstance) {
+    try {
+      ffmpegInstance.terminate();
+    } catch {
+      // ignore
+    }
+  }
+  ffmpegInstance = null;
+  ffmpegLoadingPromise = null;
+  ffmpegMultiThreaded = false;
+  ffmpegQueue = Promise.resolve();
+}
+
 export function withFFmpegLock<T>(task: (ffmpeg: FFmpeg) => Promise<T>): Promise<T> {
   const run = ffmpegQueue.then(async () => {
     const ff = await getBrowserFFmpeg();
@@ -84,6 +177,70 @@ export async function safeDeleteMemfsFile(ff: FFmpeg, path: string): Promise<voi
   } catch {
     // ignore missing file
   }
+}
+
+export interface MemfsMediaInspection {
+  hasVideo: boolean;
+  hasAudio: boolean;
+  durationSec: number;
+  width: number;
+  height: number;
+  fps: number;
+  videoCodec: string | null;
+  audioCodec: string | null;
+  maxVolumeDb: number | null;
+  meanVolumeDb: number | null;
+}
+
+export async function inspectMemfsMedia(
+  ff: FFmpeg,
+  memPath: string,
+  options?: { measureAudioVolume?: boolean }
+): Promise<MemfsMediaInspection> {
+  const logs: string[] = [];
+  const onLog = ({ message }: { message: string }) => {
+    logs.push(message);
+  };
+  ff.on('log', onLog);
+  try {
+    if (options?.measureAudioVolume) {
+      await ff
+        .exec(['-hide_banner', '-i', memPath, '-vn', '-af', 'volumedetect', '-f', 'null', '-'])
+        .catch(() => 1);
+    } else {
+      await ff.exec(['-hide_banner', '-i', memPath]).catch(() => 1);
+    }
+  } finally {
+    ff.off('log', onLog);
+  }
+
+  const joined = logs.join('\n');
+  let durationSec = 0;
+  const durMatch = /Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)/.exec(joined);
+  if (durMatch) {
+    durationSec =
+      Number(durMatch[1]) * 3600 + Number(durMatch[2]) * 60 + Number(durMatch[3]);
+  }
+
+  const videoLineMatch = /Stream #0:\d+[^\n]*Video:\s*([^,\s(]+)[^\n]*?,\s*(\d{2,5})x(\d{2,5})(?:[^\n]*?(\d+(?:\.\d+)?)\s*(?:fps|tbr))?/i.exec(
+    joined
+  );
+  const audioLineMatch = /Stream #0:\d+[^\n]*Audio:\s*([^,\s(]+)/i.exec(joined);
+  const maxVolMatch = /max_volume:\s*(-?\d+(?:\.\d+)?)\s*dB/i.exec(joined);
+  const meanVolMatch = /mean_volume:\s*(-?\d+(?:\.\d+)?)\s*dB/i.exec(joined);
+
+  return {
+    hasVideo: Boolean(videoLineMatch),
+    hasAudio: Boolean(audioLineMatch),
+    durationSec,
+    width: videoLineMatch ? Number(videoLineMatch[2]) : 0,
+    height: videoLineMatch ? Number(videoLineMatch[3]) : 0,
+    fps: videoLineMatch && videoLineMatch[4] ? Math.max(1, Number(videoLineMatch[4])) : 30,
+    videoCodec: videoLineMatch ? videoLineMatch[1] : null,
+    audioCodec: audioLineMatch ? audioLineMatch[1] : null,
+    maxVolumeDb: maxVolMatch ? Number(maxVolMatch[1]) : null,
+    meanVolumeDb: meanVolMatch ? Number(meanVolMatch[1]) : null,
+  };
 }
 
 export async function resolveMediaBlob(url: string, resolveUrlFn?: (u: string) => string): Promise<Blob> {

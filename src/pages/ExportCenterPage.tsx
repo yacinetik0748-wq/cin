@@ -104,6 +104,17 @@ export function ExportCenterPage({
     }
     return 'MP4 · H.264 / AAC (Local Browser)';
   });
+  const [renderSummary, setRenderSummary] = useState<{
+    engine: 'ffmpeg-wasm' | 'canvas-mediarecorder';
+    streamCopied?: boolean;
+    multiThreaded?: boolean;
+    renderDurationMs?: number;
+    audioBranches?: string[];
+    hasAudio?: boolean;
+    maxVolumeDb?: number | null;
+    videoCodec?: string | null;
+    audioCodec?: string | null;
+  } | null>(null);
 
   const [diagnosticSteps, setDiagnosticSteps] = useState<
     Array<{
@@ -426,8 +437,8 @@ export function ExportCenterPage({
         type: 'render',
         status: 'processing',
         progress: 5,
-        stage: 'Starting local browser render...',
-        etaSeconds: 40,
+        stage: 'Preparing media',
+        etaSeconds: null,
         outputUrl: null,
         outputSize: null,
         error: null,
@@ -444,8 +455,17 @@ export function ExportCenterPage({
       const renderRes = await localProjectService.startLocalExport(
         targetProj.id,
         settings,
-        (pct, stage) => {
-          setActiveJob((prev) => (prev ? { ...prev, progress: pct, stage } : null));
+        (pct, stage, etaSec) => {
+          setActiveJob((prev) =>
+            prev
+              ? {
+                  ...prev,
+                  progress: pct,
+                  stage,
+                  ...(etaSec !== undefined ? { etaSeconds: etaSec } : {}),
+                }
+              : null
+          );
         }
       );
 
@@ -457,6 +477,17 @@ export function ExportCenterPage({
           ? 'WebM · VP9/VP8 (Android/Browser Canvas Fallback)'
           : 'MP4 · H.264 / AAC (Local Browser FFmpeg)'
       );
+      setRenderSummary({
+        engine: renderRes.engine,
+        streamCopied: renderRes.streamCopied,
+        multiThreaded: renderRes.multiThreaded,
+        renderDurationMs: renderRes.renderDurationMs,
+        audioBranches: renderRes.audioBranches,
+        hasAudio: renderRes.inspection?.hasAudio,
+        maxVolumeDb: renderRes.inspection?.maxVolumeDb ?? null,
+        videoCodec: renderRes.inspection?.videoCodec ?? null,
+        audioCodec: renderRes.inspection?.audioCodec ?? null,
+      });
 
       updateDiagnosticStep('VIDEO_RENDERING_STARTED', 'success');
       updateDiagnosticStep('VIDEO_BLOB_CREATED', 'success');
@@ -477,12 +508,33 @@ export function ExportCenterPage({
     }
   };
 
+  const handleCancelExport = () => {
+    const cancelled = localProjectService.cancelLocalExport(project.id);
+    if (cancelled) {
+      setActiveJob((prev) =>
+        prev
+          ? {
+              ...prev,
+              status: 'failed',
+              stage: 'Cancelling export...',
+              etaSeconds: null,
+            }
+          : null
+      );
+    }
+  };
+
   const isRendering =
     activeJob && (activeJob.status === 'queued' || activeJob.status === 'processing');
 
   // Validation Checks summary
   const hasVideo = Boolean(project.sourceVideoUrl && project.metadata);
-  const dubbingReady = Boolean(project.voice.enabled && project.voice.fullDubUrl);
+  const dubbingReady = Boolean(
+    project.voice.enabled &&
+      (project.voice.fullDubUrl ||
+        (Array.isArray(project.voice.generatedClips) &&
+          project.voice.generatedClips.some((c) => Boolean(c.audioUrl))))
+  );
   const narrationAudit = project.voice.syncPlan?.narrationAudit;
   const incompleteNarration = Boolean(
     settings.applyDubbing && dubbingReady && narrationAudit && !narrationAudit.isComplete
@@ -509,22 +561,34 @@ export function ExportCenterPage({
           </p>
         </div>
 
-        {/* Prominent Export Button */}
-        <button
-          type="button"
-          onClick={handleGenerateFinalVideo}
-          disabled={!hasVideo || Boolean(isRendering) || starting}
-          className="px-6 py-3 rounded-xl bg-violet-600 hover:bg-violet-500 disabled:opacity-40 text-sm font-bold text-white flex items-center gap-2.5 whitespace-nowrap shrink-0 shadow-lg shadow-violet-600/30 cursor-pointer transition-all hover:scale-[1.02] active:scale-[0.98]"
-        >
-          {isRendering || starting ? (
-            <Loader2 className="w-5 h-5 animate-spin" />
-          ) : (
-            <Flame className="w-5 h-5 text-amber-300" />
+        {/* Prominent Export & Cancel Buttons */}
+        <div className="flex items-center gap-2.5 shrink-0">
+          {(isRendering || starting) && (
+            <button
+              type="button"
+              onClick={handleCancelExport}
+              className="px-4 py-3 rounded-xl bg-red-500/15 hover:bg-red-500/25 border border-red-500/40 text-sm font-semibold text-red-200 flex items-center gap-2 whitespace-nowrap cursor-pointer transition-colors"
+            >
+              <XCircle className="w-4 h-4 text-red-400" />
+              Cancel Export
+            </button>
           )}
-          {isRendering
-            ? `Rendering (${Math.round(activeJob?.progress || 0)}%)...`
-            : 'Export Final MP4'}
-        </button>
+          <button
+            type="button"
+            onClick={handleGenerateFinalVideo}
+            disabled={!hasVideo || Boolean(isRendering) || starting}
+            className="px-6 py-3 rounded-xl bg-violet-600 hover:bg-violet-500 disabled:opacity-40 text-sm font-bold text-white flex items-center gap-2.5 whitespace-nowrap shrink-0 shadow-lg shadow-violet-600/30 cursor-pointer transition-all hover:scale-[1.02] active:scale-[0.98]"
+          >
+            {isRendering || starting ? (
+              <Loader2 className="w-5 h-5 animate-spin" />
+            ) : (
+              <Flame className="w-5 h-5 text-amber-300" />
+            )}
+            {isRendering
+              ? `Rendering (${Math.round(activeJob?.progress || 0)}%)...`
+              : 'Export Final MP4'}
+          </button>
+        </div>
       </div>
 
       {errorMsg && (
@@ -715,7 +779,7 @@ export function ExportCenterPage({
                 {
                   key: 'applyDubbing' as const,
                   label: 'AI Narration Dub Track',
-                  count: project.voice.enabled && project.voice.fullDubUrl ? 'Ready' : 'Off',
+                  count: dubbingReady ? 'Ready' : 'Off',
                 },
                 {
                   key: 'applyAudioMix' as const,
@@ -1077,6 +1141,26 @@ export function ExportCenterPage({
                         {project.lastExportSize ? formatBytes(project.lastExportSize) : ''} · H.264 / AAC
                       </span>
                     </div>
+                    {renderSummary && (
+                      <div className="flex flex-wrap items-center gap-2 px-2.5 py-2 rounded-lg bg-[#09090B] border border-white/[0.06] text-[11px] font-mono text-zinc-300">
+                        <span className="text-emerald-400">
+                          {renderSummary.streamCopied ? 'Stream Copy (-c:v copy)' : renderSummary.multiThreaded ? 'FFmpeg WASM (Multi-thread)' : renderSummary.engine === 'canvas-mediarecorder' ? 'Canvas Fallback' : 'FFmpeg WASM'}
+                        </span>
+                        {typeof renderSummary.renderDurationMs === 'number' && (
+                          <span className="text-zinc-500">· {(renderSummary.renderDurationMs / 1000).toFixed(1)}s</span>
+                        )}
+                        {renderSummary.hasAudio !== undefined && (
+                          <span className={renderSummary.hasAudio ? 'text-emerald-300' : 'text-zinc-400'}>
+                            · Audio: {renderSummary.hasAudio ? `${renderSummary.audioCodec || 'aac'}${renderSummary.maxVolumeDb !== null && renderSummary.maxVolumeDb !== undefined ? ` (peak ${renderSummary.maxVolumeDb.toFixed(1)} dB)` : ''}` : 'None'}
+                          </span>
+                        )}
+                        {renderSummary.audioBranches && renderSummary.audioBranches.length > 0 && (
+                          <span className="text-violet-300">
+                            · Tracks: {renderSummary.audioBranches.join(', ')}
+                          </span>
+                        )}
+                      </div>
+                    )}
                   </>
                 )}
               </div>

@@ -12,6 +12,7 @@ import {
   normalizeSyncMode,
 } from '../../server/services/timeline_sync_service';
 import { idbGet, idbSet, retrieveProjectVideoBlob, storeBlobAsset } from './browserStorage';
+import { resolveMediaBlob } from './clientMediaEngine';
 import { localProjectService } from './localProjectService';
 import { distributeWordsEvenly } from './workflowStages';
 import {
@@ -193,7 +194,17 @@ export async function buildMergedDubBlobUrl(
 ): Promise<string | null> {
   if (items.length === 0) return null;
   if (items.length === 1 && items[0].startSec <= 0.1) {
-    return items[0].audioUrl;
+    if (items[0].audioUrl.startsWith('idb://blobs/')) {
+      return items[0].audioUrl;
+    }
+    try {
+      const singleBlob = await resolveMediaBlob(items[0].audioUrl);
+      const singleKey = `fish_full_dub_${Date.now()}.mp3`;
+      await storeBlobAsset(singleKey, singleBlob);
+      return `idb://blobs/${singleKey}`;
+    } catch {
+      return items[0].audioUrl;
+    }
   }
 
   const OfflineCtx =
@@ -211,25 +222,33 @@ export async function buildMergedDubBlobUrl(
   const totalFrames = Math.max(sampleRate, Math.ceil(Math.max(1, totalDurationSec) * sampleRate));
   const offline = new OfflineCtx(2, totalFrames, sampleRate);
   const decodeCtx = new AudioCtx();
+  let decodedCount = 0;
 
   try {
     for (const item of items) {
       try {
-        const res = await fetch(item.audioUrl);
-        const ab = await res.arrayBuffer();
-        const decoded = await decodeCtx.decodeAudioData(ab);
+        const blob = await resolveMediaBlob(item.audioUrl);
+        const ab = await blob.arrayBuffer();
+        const decoded = await decodeCtx.decodeAudioData(ab.slice(0));
         const src = offline.createBufferSource();
         src.buffer = decoded;
         src.connect(offline.destination);
         src.start(Math.max(0, item.startSec));
+        decodedCount += 1;
       } catch {
         // skip undecodable segment clip
       }
     }
+    if (decodedCount === 0) {
+      throw new Error('None of the generated voiceover clips could be decoded to build the narration track.');
+    }
     const rendered = await offline.startRendering();
     const wavBlob = encodeWavFromAudioBuffer(rendered);
-    return await storeBlobAsset(`fish_full_dub_${Date.now()}.wav`, wavBlob);
-  } catch {
+    const fullKey = `fish_full_dub_${Date.now()}.wav`;
+    await storeBlobAsset(fullKey, wavBlob);
+    return `idb://blobs/${fullKey}`;
+  } catch (err) {
+    if (decodedCount === 0) throw err;
     return items[0].audioUrl;
   } finally {
     await decodeCtx.close().catch(() => {});
@@ -709,7 +728,9 @@ export async function startBrowserFishDubJob(
           text: spokenText,
           referenceId: refId,
         });
-        const clipUrl = await storeBlobAsset(`fish_seg_${projectId}_${seg.id}_${Date.now()}.mp3`, blob);
+        const segKey = `fish_seg_${projectId}_${seg.id}_${Date.now()}.mp3`;
+        await storeBlobAsset(segKey, blob);
+        const clipUrl = `idb://blobs/${segKey}`;
         const slotDur = Math.max(0.2, seg.end - seg.start);
         clips.push({
           segmentId: seg.id,
@@ -777,7 +798,7 @@ export async function startBrowserFishDubJob(
           ...params.voice,
           provider: 'fish',
           enabled: true,
-          speakingSpeed: 1.0,
+          speakingSpeed: Number(params.voice.speakingSpeed || 1.0),
           syncMode,
           continuousPauseMs,
           generatedClips: syncedClips,
@@ -850,7 +871,9 @@ export async function regenerateFishSegmentsInBrowser(
       text: spokenText,
       referenceId: refId,
     });
-    const clipUrl = await storeBlobAsset(`fish_seg_${projectId}_${seg.id}_${Date.now()}.mp3`, blob);
+    const segKey = `fish_seg_${projectId}_${seg.id}_${Date.now()}.mp3`;
+    await storeBlobAsset(segKey, blob);
+    const clipUrl = `idb://blobs/${segKey}`;
     const slotDur = Math.max(0.2, seg.end - seg.start);
     existingClips.set(seg.id, {
       segmentId: seg.id,

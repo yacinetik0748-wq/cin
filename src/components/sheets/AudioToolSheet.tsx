@@ -50,6 +50,7 @@ import { TimelineSyncCard } from '../TimelineSyncCard';
 import { NarratorSelector } from '../NarratorSelector';
 import { CollapsibleSection } from '../ui/CollapsibleSection';
 import { StudioToolMemory } from './toolMemory';
+import { downloadProjectAsset, resolvePlayableAssetUrl } from '../../lib/supabaseCloud';
 
 interface AudioToolSheetProps {
   project: Project;
@@ -133,6 +134,7 @@ export function AudioToolSheet({
   const [focusAudioOverflowSignal, setFocusAudioOverflowSignal] = useState(0);
 
   const [previewAudioUrl, setPreviewAudioUrl] = useState<string | null>(null);
+  const [resolvedFullDubUrl, setResolvedFullDubUrl] = useState<string | null>(null);
   const [activeDubJob, setActiveDubJob] = useState<RenderJob | null>(null);
   const [statusMsg, setStatusMsg] = useState<string | null>(null);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
@@ -163,6 +165,24 @@ export function AudioToolSheet({
       })
       .catch(() => {});
   }, [project.id, project.translation.sourceLanguage]);
+
+  useEffect(() => {
+    let active = true;
+    if (!project.voice.fullDubUrl) {
+      setResolvedFullDubUrl(null);
+      return;
+    }
+    void resolvePlayableAssetUrl(project.voice.fullDubUrl, project.cloudAssets)
+      .then((url) => {
+        if (active) setResolvedFullDubUrl(url || project.voice.fullDubUrl || null);
+      })
+      .catch(() => {
+        if (active) setResolvedFullDubUrl(project.voice.fullDubUrl || null);
+      });
+    return () => {
+      active = false;
+    };
+  }, [project.voice.fullDubUrl, project.cloudAssets]);
 
   const loadFishVoices = async (opts?: { q?: string; self?: boolean }) => {
     setLoadingVoices(true);
@@ -1234,11 +1254,25 @@ export function AudioToolSheet({
               <div className="pt-1 border-t border-white/[0.06] space-y-1">
                 <div className="flex items-center justify-between text-[11px] text-emerald-300">
                   <span>Full Dub Ready ({voice.generatedClips.length} clips)</span>
-                  <a href={`${voice.fullDubUrl}?download=1`} className="text-violet-300 hover:text-violet-200 font-mono">
-                    Download MP3
-                  </a>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      if (!voice.fullDubUrl) return;
+                      const ext = voice.fullDubUrl.toLowerCase().endsWith('.wav') ? 'wav' : 'mp3';
+                      void downloadProjectAsset({
+                        url: voice.fullDubUrl,
+                        cloudAssets: project.cloudAssets,
+                        filename: `${project.name.replace(/[^a-zA-Z0-9_-]/g, '_')}_dub.${ext}`,
+                      }).catch((err) => setErrorMsg(err instanceof Error ? err.message : String(err)));
+                    }}
+                    className="text-violet-300 hover:text-violet-200 font-mono cursor-pointer"
+                  >
+                    Download Audio
+                  </button>
                 </div>
-                <audio src={voice.fullDubUrl} controls className="w-full h-8" />
+                {resolvedFullDubUrl && (
+                  <audio src={resolvedFullDubUrl} controls className="w-full h-8" />
+                )}
               </div>
             )}
           </div>

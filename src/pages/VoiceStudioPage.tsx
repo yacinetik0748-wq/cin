@@ -44,6 +44,7 @@ import {
 } from '../lib/workflowStages';
 import { TimelineSyncCard } from '../components/TimelineSyncCard';
 import { NarratorSelector } from '../components/NarratorSelector';
+import { downloadProjectAsset, resolvePlayableAssetUrl } from '../lib/supabaseCloud';
 
 interface VoiceStudioPageProps {
   project: Project;
@@ -160,6 +161,7 @@ export function VoiceStudioPage({
   const [busySfx, setBusySfx] = useState(false);
 
   const [previewAudioUrl, setPreviewAudioUrl] = useState<string | null>(null);
+  const [resolvedFullDubUrl, setResolvedFullDubUrl] = useState<string | null>(null);
   const [audioWaveforms, setAudioWaveforms] = useState<ProjectAudioWaveforms | null>(null);
   const [activeDubJob, setActiveDubJob] = useState<RenderJob | null>(null);
   const [statusMsg, setStatusMsg] = useState<string | null>(null);
@@ -203,6 +205,25 @@ export function VoiceStudioPage({
       })
       .catch(() => {});
   }, [project.id, project.voice.targetLanguage, project.translation.targetLanguage]);
+
+  // Resolve durable idb://blobs/... fullDubUrl to a playable browser URL
+  useEffect(() => {
+    let active = true;
+    if (!project.voice.fullDubUrl) {
+      setResolvedFullDubUrl(null);
+      return;
+    }
+    void resolvePlayableAssetUrl(project.voice.fullDubUrl, project.cloudAssets)
+      .then((url) => {
+        if (active) setResolvedFullDubUrl(url || project.voice.fullDubUrl || null);
+      })
+      .catch(() => {
+        if (active) setResolvedFullDubUrl(project.voice.fullDubUrl || null);
+      });
+    return () => {
+      active = false;
+    };
+  }, [project.voice.fullDubUrl, project.cloudAssets]);
 
   // Fetch genuine PCM audio waveforms for dub track, per-segment clips, original audio, music, and SFX
   useEffect(() => {
@@ -544,7 +565,7 @@ export function VoiceStudioPage({
     })
     .filter((item) => item.overflow > 0.15);
 
-  const toggleSegmentAudioPreview = (segmentId: string, audioUrl: string) => {
+  const toggleSegmentAudioPreview = async (segmentId: string, audioUrl: string) => {
     if (playingSegmentId === segmentId && segAudioRef.current) {
       segAudioRef.current.pause();
       setPlayingSegmentId(null);
@@ -553,7 +574,9 @@ export function VoiceStudioPage({
     if (segAudioRef.current) {
       segAudioRef.current.pause();
     }
-    const audio = new Audio(audioUrl);
+    const playableUrl =
+      (await resolvePlayableAssetUrl(audioUrl, project.cloudAssets).catch(() => null)) || audioUrl;
+    const audio = new Audio(playableUrl);
     segAudioRef.current = audio;
     setPlayingSegmentId(segmentId);
     audio.onended = () => setPlayingSegmentId(null);
@@ -1334,12 +1357,21 @@ export function VoiceStudioPage({
                     Full Dub Track ({voice.generatedClips.length} clips ·{' '}
                     {validation.summary.totalAudioDuration.toFixed(1)}s speech)
                   </span>
-                  <a
-                    href={`${voice.fullDubUrl}?download=1`}
-                    className="font-mono text-violet-300 hover:text-violet-200"
+                  <button
+                    type="button"
+                    onClick={() => {
+                      if (!voice.fullDubUrl) return;
+                      const ext = voice.fullDubUrl.toLowerCase().endsWith('.wav') ? 'wav' : 'mp3';
+                      void downloadProjectAsset({
+                        url: voice.fullDubUrl,
+                        cloudAssets: project.cloudAssets,
+                        filename: `${project.name.replace(/[^a-zA-Z0-9_-]/g, '_')}_dub.${ext}`,
+                      }).catch((err) => setErrorMsg(err instanceof Error ? err.message : String(err)));
+                    }}
+                    className="font-mono text-violet-300 hover:text-violet-200 cursor-pointer"
                   >
-                    Download MP3
-                  </a>
+                    Download Audio
+                  </button>
                 </div>
                 <WaveformStrip
                   peaks={dubPeaks}
@@ -1347,7 +1379,9 @@ export function VoiceStudioPage({
                   heightClass="h-8"
                   emptyLabel="Narration waveform ready"
                 />
-                <audio src={voice.fullDubUrl} controls className="w-full h-9" />
+                {resolvedFullDubUrl && (
+                  <audio src={resolvedFullDubUrl} controls className="w-full h-9" />
+                )}
               </div>
             ) : (
               <div className="p-3 rounded-lg bg-[#09090B] border border-white/[0.06] text-xs text-zinc-500 flex items-center justify-between gap-2">
