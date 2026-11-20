@@ -45,6 +45,14 @@ import {
   terminateBrowserFFmpeg,
   withFFmpegLock,
 } from './clientMediaEngine';
+import {
+  computeExportTargetFps,
+  EXPORT_AUDIO_BITRATE_KBPS,
+  EXPORT_AUDIO_SAMPLE_RATE,
+  EXPORT_H264_CRF,
+  EXPORT_VIDEO_BUFSIZE_KBPS,
+  EXPORT_VIDEO_MAXRATE_KBPS,
+} from './exportEstimation';
 import { idbList, idbListRawEntries, retrieveProjectVideoBlob } from './browserStorage';
 
 export class ExportValidationError extends Error {
@@ -1431,6 +1439,7 @@ export async function renderProjectExportInBrowser(params: {
       }
 
       // Free JS heap buffers immediately once copied into MEMFS
+      const srcSizeBytes = srcEntry.bytes.byteLength;
       assetEntries.clear();
 
       if (loadedFonts.length > 0) {
@@ -1449,13 +1458,23 @@ export async function renderProjectExportInBrowser(params: {
       const hasSourceAudio = srcInfo.hasAudio;
       const srcW = Math.max(16, srcInfo.width || project.metadata?.width || 1280);
       const srcH = Math.max(16, srcInfo.height || project.metadata?.height || 720);
-      const fpsVal = Math.max(1, Math.round(srcInfo.fps || project.metadata?.fps || 30));
+      const rawSrcFps = srcInfo.fps || project.metadata?.fps || 30;
+      const videoVisible = canvas.videoVisible !== false;
+      const targetFps = computeExportTargetFps({
+        sourceFps: rawSrcFps,
+        videoVisible,
+        videoClipCount: videoClips.length,
+      });
+      const needsFpsCap = rawSrcFps > 30.5 && videoVisible && videoClips.length > 0;
+      const srcBitrateBps =
+        project.metadata?.bitrate && project.metadata.bitrate > 0
+          ? project.metadata.bitrate
+          : (srcSizeBytes * 8) / Math.max(0.5, origDur);
 
       const extraInputs: string[] = [];
       const filterSteps: string[] = [];
       let nextInputIdx = 1;
 
-      const videoVisible = canvas.videoVisible !== false;
       const videoOpacity = Math.max(0.05, Math.min(1, canvas.videoOpacity ?? 1));
       const videoRotDeg = canvas.videoRotation || 0;
       const bgVisible = canvas.bgImageVisible !== false;
@@ -1506,6 +1525,8 @@ export async function renderProjectExportInBrowser(params: {
         exportSettings.aspectRatio === 'original' &&
         width === srcW &&
         height === srcH &&
+        rawSrcFps <= 30.5 &&
+        srcBitrateBps <= 3_000_000 &&
         !hasCustomCropOrTransform &&
         !customVideoEdits &&
         (!activeSyncPlan?.holds || activeSyncPlan.holds.length === 0) &&
@@ -1521,19 +1542,20 @@ export async function renderProjectExportInBrowser(params: {
       let currentV = 'v_scaled';
       if (!canStreamCopyVideo) {
         onProgress(13, 'Processing video', null);
+        const fpsCapSuffix = needsFpsCap ? `,fps=${targetFps}` : '';
         if (!hasCustomCropOrTransform && !customVideoEdits) {
           if (exportSettings.aspectRatio === 'original') {
             if (width === srcW && height === srcH) {
-              filterSteps.push(`[0:v]setsar=1[${currentV}]`);
+              filterSteps.push(`[0:v]setsar=1${fpsCapSuffix}[${currentV}]`);
             } else {
-              filterSteps.push(`[0:v]scale=${width}:${height}:flags=lanczos,setsar=1[${currentV}]`);
+              filterSteps.push(`[0:v]scale=${width}:${height}:flags=lanczos,setsar=1${fpsCapSuffix}[${currentV}]`);
             }
           } else if (exportSettings.fitMode === 'crop') {
             filterSteps.push(
-              `[0:v]scale=${width}:${height}:force_original_aspect_ratio=increase:flags=lanczos,crop=${width}:${height},setsar=1[${currentV}]`
+              `[0:v]scale=${width}:${height}:force_original_aspect_ratio=increase:flags=lanczos,crop=${width}:${height},setsar=1${fpsCapSuffix}[${currentV}]`
             );
           } else if (exportSettings.fitMode === 'blur-pad') {
-            filterSteps.push(`[0:v]split[v_bg][v_fg]`);
+            filterSteps.push(`[0:v]${needsFpsCap ? `fps=${targetFps},` : ''}split[v_bg][v_fg]`);
             filterSteps.push(makeFastBackgroundBlurChain('v_bg', 'v_bg_b', width, height, 24));
             filterSteps.push(
               `[v_fg]scale=${width}:${height}:force_original_aspect_ratio=decrease:flags=lanczos[v_fg_s]`
@@ -1542,7 +1564,7 @@ export async function renderProjectExportInBrowser(params: {
           } else {
             const bgHex = /^#[0-9a-fA-F]{6}$/.test(canvas.bgColor || '') ? canvas.bgColor : '#09090B';
             filterSteps.push(
-              `[0:v]scale=${width}:${height}:force_original_aspect_ratio=decrease:flags=lanczos,pad=${width}:${height}:(ow-iw)/2:(oh-ih)/2:color=${bgHex},setsar=1[${currentV}]`
+              `[0:v]scale=${width}:${height}:force_original_aspect_ratio=decrease:flags=lanczos,pad=${width}:${height}:(ow-iw)/2:(oh-ih)/2:color=${bgHex},setsar=1${fpsCapSuffix}[${currentV}]`
             );
           }
         } else {
@@ -1632,7 +1654,7 @@ export async function renderProjectExportInBrowser(params: {
             if (splitTargets.length === 1) filterSteps.push(`[0:v]null[v_bg_raw]`);
             else filterSteps.push(`[0:v]split=${splitTargets.length}${splitTargets.map((l) => `[${l}]`).join('')}`);
 
-            let extraSuffix = `,eq=brightness=${brightVal},fps=${fpsVal},setsar=1`;
+            let extraSuffix = `,eq=brightness=${brightVal},fps=${targetFps},setsar=1`;
             if (totalDur > origDur + 0.05) {
               extraSuffix += `,tpad=stop_mode=clone:stop_duration=${(totalDur - origDur + 0.3).toFixed(2)}`;
             }
@@ -1641,7 +1663,7 @@ export async function renderProjectExportInBrowser(params: {
             );
 
             if (blurOpacity < 0.99 || totalDur > origDur + 0.05) {
-              filterSteps.push(`color=c=#09090B:s=${width}x${height}:r=${fpsVal}:d=${totalDur.toFixed(3)}[v_bg_dark]`);
+              filterSteps.push(`color=c=#09090B:s=${width}x${height}:r=${targetFps}:d=${totalDur.toFixed(3)}[v_bg_dark]`);
               const alphaFilter = blurOpacity < 0.99 ? `format=yuva420p,colorchannelmixer=aa=${blurOpacity.toFixed(2)}` : 'null';
               filterSteps.push(`[v_bg_blurred]${alphaFilter}[v_bg_alpha]`);
               filterSteps.push(`[v_bg_dark][v_bg_alpha]overlay=0:0:shortest=1,trim=0:${totalDur.toFixed(3)},setsar=1[v_canvas_bg]`);
@@ -1656,34 +1678,58 @@ export async function renderProjectExportInBrowser(params: {
             }
             if (bgMemPath) {
               const bgIdx = nextInputIdx++;
-              extraInputs.push('-loop', '1', '-t', totalDur.toFixed(3), '-i', bgMemPath);
+              // Set -framerate directly on image2 loop input so FFmpeg does not decode at 25fps and duplicate frames
+              extraInputs.push(
+                '-framerate',
+                String(targetFps),
+                '-loop',
+                '1',
+                '-t',
+                totalDur.toFixed(3),
+                '-i',
+                bgMemPath
+              );
               const bgScale = Math.max(0.5, Math.min(2.5, canvas.bgImageScale || 1));
               const targetBgW = Math.max(16, Math.round(width * bgScale) & ~1);
               const targetBgH = Math.max(16, Math.round(height * bgScale) & ~1);
               const bgShiftX = Math.round(((canvas.bgImageOffsetX || 0) / 100) * width);
               const bgShiftY = Math.round(((canvas.bgImageOffsetY || 0) / 100) * height);
-              filterSteps.push(`color=c=#09090B:s=${width}x${height}:r=${fpsVal}:d=${totalDur.toFixed(3)}[v_bg_dark]`);
-              let bgChain = `[${bgIdx}:v]scale=${targetBgW}:${targetBgH}:force_original_aspect_ratio=increase,fps=${fpsVal},setsar=1`;
-              if (bgOpacity < 0.99 || Math.abs(bgRotDeg) > 0.2) {
-                bgChain += `,format=rgba`;
-                if (bgOpacity < 0.99) bgChain += `,colorchannelmixer=aa=${bgOpacity.toFixed(2)}`;
-                if (Math.abs(bgRotDeg) > 0.2) {
-                  const rad = ((bgRotDeg * Math.PI) / 180).toFixed(4);
-                  bgChain += `,rotate=${rad}:ow='rotw(${rad})':oh='roth(${rad})':c=none`;
+
+              if (
+                bgOpacity >= 0.99 &&
+                Math.abs(bgRotDeg) <= 0.2 &&
+                Math.abs(bgScale - 1.0) <= 0.005 &&
+                bgShiftX === 0 &&
+                bgShiftY === 0
+              ) {
+                filterSteps.push(
+                  `[${bgIdx}:v]scale=${width}:${height}:force_original_aspect_ratio=increase:flags=lanczos,crop=${width}:${height},setsar=1[v_canvas_bg]`
+                );
+              } else {
+                filterSteps.push(`color=c=#09090B:s=${width}x${height}:r=${targetFps}:d=${totalDur.toFixed(3)}[v_bg_dark]`);
+                let bgChain = `[${bgIdx}:v]scale=${targetBgW}:${targetBgH}:force_original_aspect_ratio=increase,setsar=1`;
+                if (bgOpacity < 0.99 || Math.abs(bgRotDeg) > 0.2) {
+                  bgChain += `,format=rgba`;
+                  if (bgOpacity < 0.99) bgChain += `,colorchannelmixer=aa=${bgOpacity.toFixed(2)}`;
+                  if (Math.abs(bgRotDeg) > 0.2) {
+                    const rad = ((bgRotDeg * Math.PI) / 180).toFixed(4);
+                    bgChain += `,rotate=${rad}:ow='rotw(${rad})':oh='roth(${rad})':c=none`;
+                  }
                 }
+                filterSteps.push(`${bgChain}[v_bg_img]`);
+                filterSteps.push(`[v_bg_dark][v_bg_img]overlay=x=(W-w)/2+${bgShiftX}:y=(H-h)/2+${bgShiftY}:shortest=1[v_canvas_bg]`);
               }
-              filterSteps.push(`${bgChain}[v_bg_img]`);
-              filterSteps.push(`[v_bg_dark][v_bg_img]overlay=x=(W-w)/2+${bgShiftX}:y=(H-h)/2+${bgShiftY}:shortest=1[v_canvas_bg]`);
             } else {
               const bgHex = /^#[0-9a-fA-F]{6}$/.test(canvas.bgColor || '') ? canvas.bgColor : '#09090B';
-              filterSteps.push(`color=c=${bgHex}:s=${width}x${height}:r=${fpsVal}:d=${totalDur.toFixed(3)}[v_canvas_bg]`);
+              filterSteps.push(`color=c=${bgHex}:s=${width}x${height}:r=${targetFps}:d=${totalDur.toFixed(3)}[v_canvas_bg]`);
             }
           }
 
           if (!videoVisible || videoClips.length === 0) {
             filterSteps.push(`[${bgOut}]setsar=1[${currentV}]`);
           } else if (!customVideoEdits) {
-            filterSteps.push(`[${clipInLabels[0]}]${fgTransformSuffix}[v_fg_scaled]`);
+            const capFgFps = needsFpsCap ? `fps=${targetFps},` : '';
+            filterSteps.push(`[${clipInLabels[0]}]${capFgFps}${fgTransformSuffix}[v_fg_scaled]`);
             filterSteps.push(`[${bgOut}][v_fg_scaled]overlay=x='${fgOverlayX}':y='${fgOverlayY}':shortest=1,setsar=1[${currentV}]`);
           } else {
             let bgRunner = bgOut;
@@ -1697,7 +1743,7 @@ export async function renderProjectExportInBrowser(params: {
               const isLast = idx === videoClips.length - 1;
               const nextRunner = isLast ? currentV : `v_comp_${idx}`;
               filterSteps.push(
-                `[${clipInLabels[idx]}]trim=start=${sStart.toFixed(3)}:end=${sEnd.toFixed(3)},setpts=(PTS-STARTPTS)/${spd.toFixed(4)}+${tlStart.toFixed(3)}/TB,fps=${fpsVal}:start_time=${tlStart.toFixed(3)},${fgTransformSuffix}[${clipOut}]`
+                `[${clipInLabels[idx]}]trim=start=${sStart.toFixed(3)}:end=${sEnd.toFixed(3)},setpts=(PTS-STARTPTS)/${spd.toFixed(4)}+${tlStart.toFixed(3)}/TB,fps=${targetFps}:start_time=${tlStart.toFixed(3)},${fgTransformSuffix}[${clipOut}]`
               );
               filterSteps.push(
                 `[${bgRunner}][${clipOut}]overlay=x='${fgOverlayX}':y='${fgOverlayY}':enable='between(t,${tlStart.toFixed(3)},${tlEnd.toFixed(3)})':eof_action=pass${isLast ? ',setsar=1' : ''}[${nextRunner}]`
@@ -1932,8 +1978,8 @@ export async function renderProjectExportInBrowser(params: {
           '-c:v', 'copy',
           '-map', audioRes.audioMapLabel!,
           '-c:a', 'aac',
-          '-b:a', '192k',
-          '-ar', '44100',
+          '-b:a', `${EXPORT_AUDIO_BITRATE_KBPS}k`,
+          '-ar', String(EXPORT_AUDIO_SAMPLE_RATE),
           '-ac', '2',
           '-movflags', '+faststart',
           outFilename
@@ -1941,7 +1987,13 @@ export async function renderProjectExportInBrowser(params: {
       } else {
         args.push('-filter_complex', filterSteps.join(';'), '-map', `[${currentV}]`);
         if (audioRes.audioMapLabel) {
-          args.push('-map', audioRes.audioMapLabel, '-c:a', 'aac', '-b:a', '192k', '-ar', '44100', '-ac', '2');
+          args.push(
+            '-map', audioRes.audioMapLabel,
+            '-c:a', 'aac',
+            '-b:a', `${EXPORT_AUDIO_BITRATE_KBPS}k`,
+            '-ar', String(EXPORT_AUDIO_SAMPLE_RATE),
+            '-ac', '2'
+          );
         } else {
           args.push('-an');
         }
@@ -1950,8 +2002,13 @@ export async function renderProjectExportInBrowser(params: {
           '-c:v', 'libx264',
           '-profile:v', 'main',
           '-level', '4.0',
-          '-preset', 'superfast',
-          '-crf', '20',
+          '-preset', 'veryfast',
+          '-crf', String(EXPORT_H264_CRF),
+          '-maxrate', `${EXPORT_VIDEO_MAXRATE_KBPS}k`,
+          '-bufsize', `${EXPORT_VIDEO_BUFSIZE_KBPS}k`,
+          '-g', String(Math.max(30, targetFps * 2)),
+          '-keyint_min', String(targetFps),
+          '-sc_threshold', '40',
           '-pix_fmt', 'yuv420p',
           '-movflags', '+faststart',
           outFilename

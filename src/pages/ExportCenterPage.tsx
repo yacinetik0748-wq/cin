@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   AlertCircle,
   AlertTriangle,
@@ -28,6 +28,7 @@ import {
 import { api } from '../lib/api';
 import { getBlobAssetByKey } from '../lib/browserStorage';
 import { localProjectService } from '../lib/localProjectService';
+import { estimateExportOutputSize } from '../lib/exportEstimation';
 import { formatBytes, formatDurationShort } from '../lib/formatters';
 import { indexedDbStore } from '../lib/indexedDbStore';
 import {
@@ -166,6 +167,7 @@ export function ExportCenterPage({
     settings,
     project.metadata
   );
+  const sizeEstimate = useMemo(() => estimateExportOutputSize(project), [project]);
 
   const verifyExportedFile = useCallback(
     async (url: string | null) => {
@@ -738,6 +740,53 @@ export function ExportCenterPage({
                 </div>
               </div>
             </div>
+
+            {/* Estimated & Actual Size + Target Encoding Profile */}
+            <div className="p-3 rounded-lg bg-[#09090B] border border-white/[0.08] space-y-2 text-xs">
+              <div className="flex items-center justify-between gap-2">
+                <span className="text-zinc-400">Estimated Output Size</span>
+                <span className="font-mono font-semibold text-violet-300 tabular-nums">
+                  ~{formatBytes(sizeEstimate.estimatedBytes)}{' '}
+                  <span className="text-[11px] font-normal text-zinc-500">
+                    ({formatBytes(sizeEstimate.minBytes)}–{formatBytes(sizeEstimate.maxBytes)})
+                  </span>
+                </span>
+              </div>
+              {project.lastExportSize ? (
+                <div className="flex items-center justify-between gap-2">
+                  <span className="text-zinc-400">Actual Export Size</span>
+                  <span className="font-mono font-semibold text-emerald-300 tabular-nums">
+                    {formatBytes(project.lastExportSize)}
+                    {sizeEstimate.durationSec > 0 && (
+                      <span className="text-[11px] font-normal text-zinc-400">
+                        {' '}·{' '}
+                        {(
+                          (project.lastExportSize * 8) /
+                          Math.max(0.5, videoMetaInfo?.dur || sizeEstimate.durationSec) /
+                          1_000_000
+                        ).toFixed(2)}{' '}
+                        Mbps avg
+                      </span>
+                    )}
+                  </span>
+                </div>
+              ) : null}
+              <div className="pt-1.5 border-t border-white/[0.06] text-[11px] font-mono text-zinc-400 flex flex-wrap items-center justify-between gap-1">
+                <span>
+                  {sizeEstimate.width}×{sizeEstimate.height} · {sizeEstimate.targetFps} FPS · H.264 CRF {sizeEstimate.crf} (≤{(sizeEstimate.targetVideoMaxrateKbps / 1000).toFixed(1)} Mbps)
+                </span>
+                <span>
+                  {sizeEstimate.hasAnyAudio
+                    ? `AAC ${sizeEstimate.targetAudioBitrateKbps} kbps · 44.1 kHz`
+                    : 'Video only'}
+                </span>
+              </div>
+              {sizeEstimate.isStaticVisualMode && (
+                <div className="text-[11px] text-emerald-300/90">
+                  Static background detected — CRF {sizeEstimate.crf} skips unchanged frames for minimal size without lowering {sizeEstimate.height}p sharpness.
+                </div>
+              )}
+            </div>
           </div>
 
           {/* Export Layers & Options (Collapsed by default) */}
@@ -1134,11 +1183,18 @@ export function ExportCenterPage({
                         {videoMetaInfo
                           ? `${videoMetaInfo.w}×${videoMetaInfo.h} · ${formatDurationShort(
                               videoMetaInfo.dur
-                            )}`
-                          : `${resolvedDims.width}×${resolvedDims.height}`}
+                            )} · ${sizeEstimate.targetFps} FPS`
+                          : `${resolvedDims.width}×${resolvedDims.height} · ${sizeEstimate.targetFps} FPS`}
                       </span>
                       <span>
-                        {project.lastExportSize ? formatBytes(project.lastExportSize) : ''} · H.264 / AAC
+                        {project.lastExportSize
+                          ? `Actual: ${formatBytes(project.lastExportSize)} (${(
+                              (project.lastExportSize * 8) /
+                              Math.max(0.5, videoMetaInfo?.dur || sizeEstimate.durationSec) /
+                              1_000_000
+                            ).toFixed(2)} Mbps) · Est: ~${formatBytes(sizeEstimate.estimatedBytes)}`
+                          : `Est: ~${formatBytes(sizeEstimate.estimatedBytes)}`}{' '}
+                        · {project.lastExportUrl?.toLowerCase().endsWith('.webm') ? 'WebM' : 'H.264 / AAC 128k'}
                       </span>
                     </div>
                     {renderSummary && (

@@ -2,10 +2,18 @@ import {
   DEFAULT_VIDEO_CANVAS,
   Project,
 } from '../types/studio';
-import { resolveCanvasDimensions } from './workflowStages';
+import { getSyncedCaptionsForPreview, resolveCanvasDimensions } from './workflowStages';
+import { applyTextTransform, buildCaptionDisplaySlice, normalizeCanonicalMode } from './captionModes';
 import { retrieveProjectVideoBlob, getBlobAssetByKey } from './browserStorage';
 import { isOrigAudioActive } from './clientExportRenderer';
 import { resolveMediaBlob } from './clientMediaEngine';
+import {
+  computeExportTargetFps,
+  EXPORT_AUDIO_BITRATE_KBPS,
+  EXPORT_AUDIO_SAMPLE_RATE,
+  EXPORT_VIDEO_MAXRATE_KBPS,
+  resolveExportTimelineDuration,
+} from './exportEstimation';
 import { getEffectiveVideoClips } from './videoTimeline';
 
 export interface CanvasExportResult {
@@ -122,17 +130,14 @@ export async function renderProjectCanvasFallback(params: {
   });
 
   const clips = getEffectiveVideoClips(project);
+  const videoVisible = canvasConfig.videoVisible !== false;
   const sourceDuration = Math.max(1, project.metadata?.duration || video.duration || 10);
-  const totalDuration =
-    clips.length > 0
-      ? Math.max(
-          0.5,
-          clips.reduce(
-            (sum, c) => sum + Math.max(0.1, (c.sourceEnd - c.sourceStart) / Math.max(0.25, c.speed || 1)),
-            0
-          )
-        )
-      : sourceDuration;
+  const totalDuration = resolveExportTimelineDuration(project);
+  const targetFps = computeExportTargetFps({
+    sourceFps: project.metadata?.fps,
+    videoVisible,
+    videoClipCount: clips.length,
+  });
 
   const canvas = document.createElement('canvas');
   canvas.width = targetW;
@@ -148,6 +153,14 @@ export async function renderProjectCanvasFallback(params: {
     throw new Error('HTMLCanvasElement.captureStream() is not supported by this browser.');
   }
 
+  // Preload static background image when configured
+  const bgImage =
+    canvasConfig.backgroundType === 'image' &&
+    canvasConfig.bgImageUrl &&
+    canvasConfig.bgImageVisible !== false
+      ? await loadImageFromAssetUrl(canvasConfig.bgImageUrl)
+      : null;
+
   // Preload enabled logos
   const loadedLogos: Array<{ logo: Project['logos'][number]; img: HTMLImageElement }> = [];
   if (exportSettings.applyLogo && project.logos.length > 0) {
@@ -157,7 +170,9 @@ export async function renderProjectCanvasFallback(params: {
     }
   }
 
-  // Web Audio Context for audio mixing (Android Chrome safe)
+  const syncedCaptions = getSyncedCaptionsForPreview(project);
+
+  // Web Audio Context for audio mixing (Android Chrome safe, 44.1 kHz target)
   const AudioContextClass =
     window.AudioContext ||
     (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
@@ -173,7 +188,11 @@ export async function renderProjectCanvasFallback(params: {
 
   try {
     if (AudioContextClass) {
-      audioCtx = new AudioContextClass();
+      try {
+        audioCtx = new AudioContextClass({ sampleRate: EXPORT_AUDIO_SAMPLE_RATE });
+      } catch {
+        audioCtx = new AudioContextClass();
+      }
       if (audioCtx.state === 'suspended') {
         await audioCtx.resume().catch(() => {});
       }
@@ -307,7 +326,7 @@ export async function renderProjectCanvasFallback(params: {
   }
 
   const { mimeType: chosenMime, extension } = detectBrowserMediaRecorderFormat();
-  const canvasStream = canvas.captureStream(30);
+  const canvasStream = canvas.captureStream(targetFps);
 
   const combinedTracks = [...canvasStream.getVideoTracks()];
   if (audioDest && audioDest.stream.getAudioTracks().length > 0) {
@@ -315,18 +334,41 @@ export async function renderProjectCanvasFallback(params: {
   }
   const combinedStream = new MediaStream(combinedTracks);
 
-  let recorder: MediaRecorder;
-  try {
-    recorder = new MediaRecorder(combinedStream, {
+  // Standard W3C MediaRecorder bitrate caps ONLY (FFmpeg flags do not apply to MediaRecorder)
+  const targetVideoBps = EXPORT_VIDEO_MAXRATE_KBPS * 1000;
+  const targetAudioBps = EXPORT_AUDIO_BITRATE_KBPS * 1000;
+  const recorderOptionsAttempts: Array<MediaRecorderOptions | undefined> = [
+    {
       mimeType: chosenMime,
-      videoBitsPerSecond: 2_500_000,
-    });
-  } catch {
+      videoBitsPerSecond: targetVideoBps,
+      audioBitsPerSecond: targetAudioBps,
+    },
+    {
+      mimeType: chosenMime,
+      videoBitsPerSecond: targetVideoBps,
+    },
+    { mimeType: chosenMime },
+    undefined,
+  ];
+
+  let recorder: MediaRecorder | null = null;
+  for (const opts of recorderOptionsAttempts) {
+    try {
+      recorder = opts
+        ? new MediaRecorder(combinedStream, opts)
+        : new MediaRecorder(combinedStream);
+      break;
+    } catch {
+      // Try next supported option combination
+    }
+  }
+  if (!recorder) {
     recorder = new MediaRecorder(combinedStream);
   }
+  const activeRecorder = recorder;
 
   const recordedChunks: Blob[] = [];
-  recorder.ondataavailable = (e) => {
+  activeRecorder.ondataavailable = (e) => {
     if (e.data && e.data.size > 0) {
       recordedChunks.push(e.data);
     }
@@ -334,13 +376,16 @@ export async function renderProjectCanvasFallback(params: {
 
   onProgress(
     20,
-    `Rendering video frames locally via Canvas (${targetW}×${targetH} ${extension.toUpperCase()})...`
+    `Rendering video frames locally via Canvas (${targetW}×${targetH} @ ${targetFps} FPS ${extension.toUpperCase()})...`
   );
 
   return new Promise<CanvasExportResult>((resolve, reject) => {
     let animId = 0;
     let clipIdx = 0;
     let stopped = false;
+    let lastDrawAt = 0;
+    const frameIntervalMs = 1000 / targetFps;
+    const renderStartPerf = performance.now();
 
     const cleanup = () => {
       if (stopped) return;
@@ -373,22 +418,22 @@ export async function renderProjectCanvasFallback(params: {
     };
 
     const onAbort = () => {
-      if (recorder.state === 'recording') {
-        try { recorder.stop(); } catch { /* ignore */ }
+      if (activeRecorder.state === 'recording') {
+        try { activeRecorder.stop(); } catch { /* ignore */ }
       }
       cleanup();
       reject(new DOMException('Export cancelled by user.', 'AbortError'));
     };
     signal?.addEventListener('abort', onAbort, { once: true });
 
-    recorder.onerror = (err) => {
+    activeRecorder.onerror = (err) => {
       cleanup();
       reject(err);
     };
 
-    recorder.onstop = () => {
+    activeRecorder.onstop = () => {
       cleanup();
-      const finalBlob = new Blob(recordedChunks, { type: recorder.mimeType || chosenMime });
+      const finalBlob = new Blob(recordedChunks, { type: activeRecorder.mimeType || chosenMime });
       if (finalBlob.size === 0) {
         reject(new Error('Canvas fallback produced an empty video blob (0 bytes).'));
         return;
@@ -397,13 +442,13 @@ export async function renderProjectCanvasFallback(params: {
       resolve({
         blob: finalBlob,
         filename: `${project.name.replace(/[^a-zA-Z0-9_-]/g, '_')}_final.${extension}`,
-        mimeType: recorder.mimeType || chosenMime,
+        mimeType: activeRecorder.mimeType || chosenMime,
         sizeBytes: finalBlob.size,
         engine: 'canvas-mediarecorder',
       });
     };
 
-    recorder.start(250);
+    activeRecorder.start(250);
 
     const activeClips =
       clips.length > 0
@@ -421,32 +466,50 @@ export async function renderProjectCanvasFallback(params: {
 
     let timelineElapsedOffset = 0;
 
-    const drawFrame = () => {
-      const currentClip = activeClips[clipIdx];
-      if (!currentClip) {
-        if (recorder.state === 'recording') recorder.stop();
-        return;
-      }
+    const drawFrame = (now: number) => {
+      let timelineTime = 0;
 
-      const speed = Math.max(0.25, currentClip.speed || 1);
-      video.playbackRate = speed;
-
-      const curSource = video.currentTime;
-      if (curSource >= currentClip.sourceEnd - 0.04 || video.ended) {
-        timelineElapsedOffset += (currentClip.sourceEnd - currentClip.sourceStart) / speed;
-        clipIdx += 1;
-        const nextClip = activeClips[clipIdx];
-        if (!nextClip) {
-          if (recorder.state === 'recording') recorder.stop();
+      if (!videoVisible || clips.length === 0) {
+        // Static visual mode (e.g., background image + narration + karaoke captions)
+        timelineTime = Math.min(totalDuration, Math.max(0, (now - renderStartPerf) / 1000));
+        if (timelineTime >= totalDuration - 0.02) {
+          if (activeRecorder.state === 'recording') activeRecorder.stop();
           return;
         }
-        video.currentTime = nextClip.sourceStart;
+      } else {
+        const currentClip = activeClips[clipIdx];
+        if (!currentClip) {
+          if (activeRecorder.state === 'recording') activeRecorder.stop();
+          return;
+        }
+
+        const speed = Math.max(0.25, currentClip.speed || 1);
+        video.playbackRate = speed;
+
+        const curSource = video.currentTime;
+        if (curSource >= currentClip.sourceEnd - 0.04 || video.ended) {
+          timelineElapsedOffset += (currentClip.sourceEnd - currentClip.sourceStart) / speed;
+          clipIdx += 1;
+          const nextClip = activeClips[clipIdx];
+          if (!nextClip) {
+            if (activeRecorder.state === 'recording') activeRecorder.stop();
+            return;
+          }
+          video.currentTime = nextClip.sourceStart;
+        }
+
+        timelineTime = Math.min(
+          totalDuration,
+          timelineElapsedOffset + Math.max(0, curSource - currentClip.sourceStart) / speed
+        );
       }
 
-      const timelineTime = Math.min(
-        totalDuration,
-        timelineElapsedOffset + Math.max(0, curSource - currentClip.sourceStart) / speed
-      );
+      // Throttle canvas painting to targetFps (prevents 60-120 Hz over-drawing & frame duplication)
+      if (lastDrawAt !== 0 && now - lastDrawAt < frameIntervalMs - 2) {
+        animId = requestAnimationFrame(drawFrame);
+        return;
+      }
+      lastDrawAt = now;
 
       const progress = Math.min(95, 20 + Math.round((timelineTime / totalDuration) * 75));
       onProgress(
@@ -458,7 +521,29 @@ export async function renderProjectCanvasFallback(params: {
       ctx.fillStyle = canvasConfig.bgColor || '#09090B';
       ctx.fillRect(0, 0, targetW, targetH);
 
-      // 2. Draw video frame with fit / crop mode
+      // 1b. Static background image when configured
+      if (bgImage && bgImage.naturalWidth > 0 && bgImage.naturalHeight > 0) {
+        const bgScale = Math.max(0.5, Math.min(2.5, canvasConfig.bgImageScale || 1));
+        const coverScale = Math.max(targetW / bgImage.naturalWidth, targetH / bgImage.naturalHeight) * bgScale;
+        const bw = bgImage.naturalWidth * coverScale;
+        const bh = bgImage.naturalHeight * coverScale;
+        const bx = (targetW - bw) / 2 + ((canvasConfig.bgImageOffsetX || 0) / 100) * targetW;
+        const by = (targetH - bh) / 2 + ((canvasConfig.bgImageOffsetY || 0) / 100) * targetH;
+        const bgOpacity = Math.max(0.05, Math.min(1, canvasConfig.bgImageOpacity ?? 1));
+        const bgRot = ((canvasConfig.bgImageRotation || 0) * Math.PI) / 180;
+        ctx.save();
+        ctx.globalAlpha = bgOpacity;
+        if (Math.abs(bgRot) > 0.003) {
+          ctx.translate(bx + bw / 2, by + bh / 2);
+          ctx.rotate(bgRot);
+          ctx.drawImage(bgImage, -bw / 2, -bh / 2, bw, bh);
+        } else {
+          ctx.drawImage(bgImage, bx, by, bw, bh);
+        }
+        ctx.restore();
+      }
+
+      // 2. Draw video frame with fit / crop mode (when video track is visible)
       const vw = video.videoWidth || targetW;
       const vh = video.videoHeight || targetH;
       const useCrop =
@@ -473,34 +558,37 @@ export async function renderProjectCanvasFallback(params: {
       const dx = (targetW - dw) / 2 + ((canvasConfig.offsetX || 0) / 100) * targetW;
       const dy = (targetH - dh) / 2 + ((canvasConfig.offsetY || 0) / 100) * targetH;
 
-      ctx.save();
-      if (exportSettings.fitMode === 'blur-pad') {
-        const bgScale = Math.max(targetW / vw, targetH / vh);
-        const bw = vw * bgScale;
-        const bh = vh * bgScale;
-        ctx.filter = 'blur(18px) brightness(0.7)';
-        ctx.drawImage(video, (targetW - bw) / 2, (targetH - bh) / 2, bw, bh);
-        ctx.filter = 'none';
-      }
-      ctx.drawImage(video, dx, dy, dw, dh);
-      ctx.restore();
+      if (videoVisible && clips.length > 0) {
+        ctx.save();
+        ctx.globalAlpha = Math.max(0.05, Math.min(1, canvasConfig.videoOpacity ?? 1));
+        if (exportSettings.fitMode === 'blur-pad') {
+          const bgScale = Math.max(targetW / vw, targetH / vh);
+          const bw = vw * bgScale;
+          const bh = vh * bgScale;
+          ctx.filter = 'blur(18px) brightness(0.7)';
+          ctx.drawImage(video, (targetW - bw) / 2, (targetH - bh) / 2, bw, bh);
+          ctx.filter = 'none';
+        }
+        ctx.drawImage(video, dx, dy, dw, dh);
+        ctx.restore();
 
-      // 3. Draw active blur zones
-      if (exportSettings.applyBlur && project.blurs.length > 0) {
-        for (const blur of project.blurs.filter(
-          (b) => b.enabled && timelineTime >= b.startTime && timelineTime <= b.endTime
-        )) {
-          const bx = blur.mode === 'full' ? 0 : blur.x * targetW;
-          const by = blur.mode === 'full' ? 0 : blur.y * targetH;
-          const bw = blur.mode === 'full' ? targetW : blur.width * targetW;
-          const bh = blur.mode === 'full' ? targetH : blur.height * targetH;
-          ctx.save();
-          ctx.beginPath();
-          ctx.rect(bx, by, bw, bh);
-          ctx.clip();
-          ctx.filter = `blur(${Math.max(4, Math.min(32, blur.radius || blur.intensity || 16))}px)`;
-          ctx.drawImage(video, dx, dy, dw, dh);
-          ctx.restore();
+        // 3. Draw active blur zones
+        if (exportSettings.applyBlur && project.blurs.length > 0) {
+          for (const blur of project.blurs.filter(
+            (b) => b.enabled && timelineTime >= b.startTime && timelineTime <= b.endTime
+          )) {
+            const bx = blur.mode === 'full' ? 0 : blur.x * targetW;
+            const by = blur.mode === 'full' ? 0 : blur.y * targetH;
+            const bw = blur.mode === 'full' ? targetW : blur.width * targetW;
+            const bh = blur.mode === 'full' ? targetH : blur.height * targetH;
+            ctx.save();
+            ctx.beginPath();
+            ctx.rect(bx, by, bw, bh);
+            ctx.clip();
+            ctx.filter = `blur(${Math.max(4, Math.min(32, blur.radius || blur.intensity || 16))}px)`;
+            ctx.drawImage(video, dx, dy, dw, dh);
+            ctx.restore();
+          }
         }
       }
 
@@ -520,23 +608,113 @@ export async function renderProjectCanvasFallback(params: {
         }
       }
 
-      // 5. Draw active captions
-      if (exportSettings.applyCaptions && project.captions.length > 0) {
-        const activeCaption = project.captions.find(
-          (c) => timelineTime >= c.start && timelineTime <= c.end
+      // 5. Draw active synced captions with karaoke / active-word highlighting preserved
+      if (
+        exportSettings.applyCaptions &&
+        project.subtitleStyle.enabled &&
+        project.subtitleStyle.visible !== false &&
+        syncedCaptions.length > 0
+      ) {
+        const activeCaption = syncedCaptions.find(
+          (c) => timelineTime >= c.syncedStart && timelineTime <= c.syncedEnd
         );
-        const text = activeCaption?.translatedText || activeCaption?.text;
-        if (text) {
-          const fs = Math.max(18, Math.round(targetH * 0.042));
-          ctx.font = `bold ${fs}px ${project.subtitleStyle.fontFamily || 'sans-serif'}`;
-          ctx.textAlign = 'center';
-          ctx.fillStyle = project.subtitleStyle.primaryColor || '#FFFFFF';
-          ctx.strokeStyle = project.subtitleStyle.outlineColor || '#000000';
-          ctx.lineWidth = Math.max(2, Math.round(fs * 0.12));
-          const cx = targetW / 2;
-          const cy = targetH * 0.85;
-          ctx.strokeText(text, cx, cy, targetW * 0.88);
-          ctx.fillText(text, cx, cy, targetW * 0.88);
+        if (activeCaption) {
+          const style = project.subtitleStyle;
+          const mode = normalizeCanonicalMode(style.mode);
+          const slice = buildCaptionDisplaySlice({
+            mode: style.mode,
+            words: activeCaption.words || [],
+            currentTime: timelineTime,
+            wordsPerDisplay: style.wordsPerDisplay,
+            chunkSize: style.chunkSize,
+          });
+          const scaleMul = Math.max(0.5, Math.min(2.5, style.scale || 1));
+          const fs = Math.max(18, Math.round((style.fontSize || Math.round(targetH * 0.042)) * (targetH / 1080) * scaleMul));
+          const fontWeight = style.fontWeight || 'bold';
+          ctx.font = `${style.italic ? 'italic ' : ''}${fontWeight} ${fs}px ${style.fontFamily || 'sans-serif'}`;
+          ctx.textBaseline = 'middle';
+          const outlineCol = style.outlineColor || '#000000';
+          const primaryCol = style.primaryColor || '#FFFFFF';
+          const highlightCol = style.highlightColor || '#FACC15';
+          ctx.strokeStyle = outlineCol;
+          ctx.lineWidth = Math.max(2, Math.round((style.outlineWidth || 3) * (fs / 38)));
+          ctx.lineJoin = 'round';
+
+          const maxTextW = (Math.max(30, Math.min(100, style.maxWidthPct || 86)) / 100) * targetW;
+          const posYFrac =
+            style.position === 'top'
+              ? 0.14
+              : style.position === 'middle'
+              ? 0.5
+              : style.position === 'custom'
+              ? Math.max(0.08, Math.min(0.92, (style.posY || 85) / 100))
+              : 0.85;
+          const baseCenterX =
+            style.position === 'custom'
+              ? Math.max(0.1, Math.min(0.9, (style.posX || 50) / 100)) * targetW
+              : targetW / 2;
+
+          if (slice.words.length > 0) {
+            const spaceW = ctx.measureText(' ').width;
+            const tokens = slice.words.map((w) => {
+              const displayWord = applyTextTransform(w.word, style);
+              const isHighlighted =
+                mode === 'karaoke' || mode === 'progressive-reveal' || mode === 'typewriter'
+                  ? w.isPast
+                  : w.isActive;
+              return {
+                text: displayWord,
+                width: ctx.measureText(displayWord).width,
+                isHighlighted,
+              };
+            });
+
+            // Wrap into lines cleanly
+            const lines: Array<typeof tokens> = [];
+            let currentLine: typeof tokens = [];
+            let currentLineW = 0;
+            for (const tok of tokens) {
+              const nextW = currentLine.length === 0 ? tok.width : currentLineW + spaceW + tok.width;
+              if (currentLine.length > 0 && nextW > maxTextW) {
+                lines.push(currentLine);
+                currentLine = [tok];
+                currentLineW = tok.width;
+              } else {
+                currentLine.push(tok);
+                currentLineW = nextW;
+              }
+            }
+            if (currentLine.length > 0) lines.push(currentLine);
+
+            const lineHeight = fs * (1.28 + Math.max(0, style.lineSpacing || 0) * 0.04);
+            const totalTextH = lines.length * lineHeight;
+            const startY = targetH * posYFrac - totalTextH / 2 + lineHeight / 2;
+
+            lines.forEach((line, lIdx) => {
+              const lineW =
+                line.reduce((sum, t) => sum + t.width, 0) + Math.max(0, line.length - 1) * spaceW;
+              let cursorX = baseCenterX - lineW / 2;
+              const y = startY + lIdx * lineHeight;
+              ctx.textAlign = 'left';
+              for (const tok of line) {
+                ctx.fillStyle = tok.isHighlighted ? highlightCol : primaryCol;
+                if ((style.outlineWidth ?? 2) > 0) {
+                  ctx.strokeText(tok.text, cursorX, y);
+                }
+                ctx.fillText(tok.text, cursorX, y);
+                cursorX += tok.width + spaceW;
+              }
+            });
+          } else {
+            const fallbackRaw = activeCaption.translatedText || activeCaption.text;
+            const fallbackText = fallbackRaw ? applyTextTransform(fallbackRaw, style) : '';
+            if (fallbackText) {
+              ctx.textAlign = 'center';
+              ctx.fillStyle = primaryCol;
+              ctx.strokeText(fallbackText, baseCenterX, targetH * posYFrac, maxTextW);
+              ctx.fillText(fallbackText, baseCenterX, targetH * posYFrac, maxTextW);
+            }
+          }
         }
       }
 
@@ -544,13 +722,18 @@ export async function renderProjectCanvasFallback(params: {
     };
 
     const startPlayback = async () => {
-      video.currentTime = activeClips[0]?.sourceStart || 0;
-      try {
-        await video.play();
-      } catch {
-        // Android Chrome fallback when autoplay policy blocks unmuted playback after async gap
-        video.muted = true;
-        await video.play();
+      if (videoVisible && clips.length > 0) {
+        video.currentTime = activeClips[0]?.sourceStart || 0;
+        try {
+          await video.play();
+        } catch {
+          // Android Chrome fallback when autoplay policy blocks unmuted playback after async gap
+          video.muted = true;
+          await video.play();
+        }
+      } else if (isOrigAudioActive(project.voice)) {
+        video.currentTime = 0;
+        video.play().catch(() => {});
       }
       if (dubAudioEl) {
         const offsetSec = Number(project.voice.timingOffsetSec || 0);
@@ -578,9 +761,9 @@ export async function renderProjectCanvasFallback(params: {
     };
 
     startPlayback().catch((err) => {
-      if (recorder.state === 'recording') {
+      if (activeRecorder.state === 'recording') {
         try {
-          recorder.stop();
+          activeRecorder.stop();
         } catch {
           // ignore
         }
