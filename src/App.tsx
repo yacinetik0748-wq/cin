@@ -276,6 +276,7 @@ export default function App() {
       videoRef.current?.pause();
       setActiveTool(null);
       setMoreMenuOpen(false);
+      setMobileHeaderMenuOpen(false);
       setSettingsInitialTab(tab);
       const currentView = activeViewRef.current;
       if (currentView !== 'settings') {
@@ -293,6 +294,8 @@ export default function App() {
   const [timelineExpanded, setTimelineExpanded] = useState(false);
   const [timelineHeightPx, setTimelineHeightPx] = useState(256);
   const [moreMenuOpen, setMoreMenuOpen] = useState(false);
+  const [mobilePreviewCollapsed, setMobilePreviewCollapsed] = useState(false);
+  const [mobileHeaderMenuOpen, setMobileHeaderMenuOpen] = useState(false);
 
   const handleTimelineSplitterDown = useCallback(
     (e: React.PointerEvent<HTMLDivElement>) => {
@@ -3610,6 +3613,7 @@ export default function App() {
     async (step: PipelineStepId) => {
       videoRef.current?.pause();
       setMoreMenuOpen(false);
+      setMobileHeaderMenuOpen(false);
       if (!activeProject) return;
       await flushPendingSaves(activeProject.id);
       if (step === 'translator') {
@@ -3658,8 +3662,272 @@ export default function App() {
 
   return (
     <div className="h-dvh w-screen overflow-hidden bg-[#09090B] text-zinc-100 flex flex-col">
-      {/* Compact CapCut-Style Top Bar */}
-      <header className="h-13 px-2.5 sm:px-4 border-b border-white/[0.08] bg-[#0B0B0F] flex items-center justify-between gap-2 shrink-0 z-30">
+      {/* Dedicated Mobile Editor Top Header (< lg) */}
+      {activeView === 'editor' && activeProject && (
+        <header className="lg:hidden relative h-12 px-1.5 border-b border-white/[0.08] bg-[#0B0B0F] flex items-center justify-between gap-1.5 shrink-0 z-30">
+          <div className="flex items-center gap-1 min-w-0 flex-1">
+            <button
+              type="button"
+              onClick={async () => {
+                videoRef.current?.pause();
+                setActiveTool(null);
+                setMobileHeaderMenuOpen(false);
+                if (activeProject?.id) {
+                  await flushPendingSaves(activeProject.id);
+                }
+                updateActiveView('voice', { projectId: activeProject.id });
+              }}
+              className="min-w-[40px] min-h-[40px] p-1.5 rounded-xl text-zinc-200 hover:text-white hover:bg-white/[0.06] flex items-center justify-center cursor-pointer shrink-0"
+              aria-label="Back to Voice Studio"
+              title="Back to Voice Studio"
+            >
+              <ChevronLeft className="w-5 h-5" />
+            </button>
+
+            <div className="min-w-0 flex flex-col justify-center">
+              <span className="text-[12.5px] font-semibold text-zinc-100 truncate leading-tight">
+                {activeProject.name || 'Untitled Project'}
+              </span>
+              <div
+                role="status"
+                aria-live="polite"
+                data-save-status={saveStatus}
+                className="flex items-center gap-1 text-[10px] leading-tight mt-0.5"
+              >
+                {saveStatus === 'error' ? (
+                  <>
+                    <AlertTriangle className="w-2.5 h-2.5 text-red-400 shrink-0" />
+                    <span className="text-red-300 truncate">Save failed</span>
+                    <button
+                      type="button"
+                      onClick={() => void flushPendingSaves(activeProject.id)}
+                      className="text-red-200 underline font-semibold cursor-pointer shrink-0"
+                    >
+                      Retry
+                    </button>
+                  </>
+                ) : saveStatus === 'saving' || hasUnsavedChanges ? (
+                  <>
+                    <Loader2 className="w-2.5 h-2.5 animate-spin text-amber-300 shrink-0" />
+                    <span className="text-amber-300">Saving...</span>
+                  </>
+                ) : (
+                  <>
+                    <Check className="w-2.5 h-2.5 text-emerald-400 shrink-0" />
+                    <span className="text-zinc-400">Saved</span>
+                  </>
+                )}
+              </div>
+            </div>
+          </div>
+
+          <div className="flex items-center gap-1 shrink-0">
+            <button
+              type="button"
+              onClick={() => setMobileHeaderMenuOpen((v) => !v)}
+              aria-label="Project & workflow menu"
+              aria-expanded={mobileHeaderMenuOpen}
+              className={`min-w-[40px] min-h-[40px] rounded-xl border flex items-center justify-center cursor-pointer transition-colors ${
+                mobileHeaderMenuOpen
+                  ? 'bg-violet-600/20 border-violet-500/50 text-white'
+                  : 'bg-[#14141A] border-white/[0.08] text-zinc-300 hover:text-white'
+              }`}
+            >
+              <MoreHorizontal className="w-4 h-4" />
+            </button>
+
+            <button
+              type="button"
+              onClick={async () => {
+                videoRef.current?.pause();
+                setActiveTool(null);
+                setMoreMenuOpen(false);
+                setMobileHeaderMenuOpen(false);
+                await flushPendingSaves(activeProject.id);
+                updateActiveView('export', { projectId: activeProject.id });
+              }}
+              disabled={!activeProject.sourceVideoUrl && !activeProject.sourceVideoBlobKey}
+              className="min-h-[36px] px-3 py-1.5 rounded-xl bg-violet-600 hover:bg-violet-500 disabled:opacity-40 text-xs font-semibold text-white flex items-center gap-1.5 whitespace-nowrap shrink-0 cursor-pointer shadow-lg shadow-violet-600/25"
+            >
+              <Upload className="w-3.5 h-3.5" />
+              <span>Export</span>
+            </button>
+          </div>
+
+          {mobileHeaderMenuOpen && (
+            <>
+              <div
+                className="fixed inset-0 z-40 bg-black/40"
+                onClick={() => setMobileHeaderMenuOpen(false)}
+              />
+              <div
+                role="menu"
+                aria-label="Mobile editor header menu"
+                className="fixed top-12 right-2 z-50 w-[min(18.5rem,calc(100vw-1rem))] max-h-[calc(100dvh-4rem)] overflow-y-auto rounded-2xl bg-[#141419] border border-white/[0.12] shadow-2xl p-2.5 space-y-2.5 text-xs"
+              >
+                <div>
+                  <div className="px-1.5 pb-1 text-[10px] font-semibold uppercase tracking-wider text-zinc-400">
+                    Workflow Steps
+                  </div>
+                  <div className="space-y-1">
+                    {pipelineSteps.map((step) => {
+                      const isCurrent = step.active;
+                      const isDone = step.completed && !isCurrent;
+                      return (
+                        <button
+                          key={step.id}
+                          type="button"
+                          disabled={!step.accessible}
+                          onClick={() => void handleSelectPipelineStep(step.id)}
+                          className={`w-full min-h-[38px] px-2.5 py-1.5 rounded-xl flex items-center justify-between gap-2 text-left transition-colors ${
+                            isCurrent
+                              ? 'bg-violet-600/25 border border-violet-500/50 text-white font-semibold cursor-pointer'
+                              : isDone
+                              ? 'bg-emerald-500/10 border border-emerald-500/20 text-emerald-200 hover:bg-emerald-500/20 cursor-pointer'
+                              : step.accessible
+                              ? 'bg-zinc-900/70 border border-white/[0.06] text-zinc-200 hover:bg-zinc-800 cursor-pointer'
+                              : 'bg-zinc-900/30 border border-white/[0.04] text-zinc-600 cursor-not-allowed'
+                          }`}
+                        >
+                          <span className="flex items-center gap-2 min-w-0">
+                            <span
+                              className={`w-5 h-5 rounded-full text-[10px] font-mono flex items-center justify-center shrink-0 ${
+                                isCurrent
+                                  ? 'bg-violet-500 text-white'
+                                  : isDone
+                                  ? 'bg-emerald-500/25 text-emerald-300'
+                                  : 'bg-zinc-800 text-zinc-400'
+                              }`}
+                            >
+                              {isDone ? <Check className="w-3 h-3" /> : step.number}
+                            </span>
+                            <span className="truncate">{step.label}</span>
+                          </span>
+                          {isCurrent && (
+                            <span className="text-[10px] text-violet-300 shrink-0">Active</span>
+                          )}
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
+
+                {projects.length > 1 && (
+                  <div className="pt-1 border-t border-white/[0.08]">
+                    <label className="block px-1.5 pb-1 text-[10px] font-semibold uppercase tracking-wider text-zinc-400">
+                      Switch Project
+                    </label>
+                    <select
+                      value={activeProject.id}
+                      onChange={(e) => {
+                        const found = projects.find((p) => p.id === e.target.value);
+                        if (found) {
+                          setMobileHeaderMenuOpen(false);
+                          handleSelectProject(found, undefined, { preserveView: true });
+                        }
+                      }}
+                      className="w-full min-h-[38px] bg-[#1A1A22] border border-white/[0.1] rounded-xl px-2.5 py-1.5 text-xs text-zinc-100 focus:outline-none focus:border-violet-500 cursor-pointer"
+                      aria-label="Switch active project"
+                    >
+                      {projects.map((p) => (
+                        <option key={p.id} value={p.id} className="bg-[#111115] text-zinc-100">
+                          {p.name}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                )}
+
+                <div className="pt-1 border-t border-white/[0.08] space-y-1">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setMobileHeaderMenuOpen(false);
+                      setSaveStyleModalOpen(true);
+                    }}
+                    className="w-full min-h-[38px] px-2.5 py-1.5 rounded-xl hover:bg-white/[0.06] text-zinc-200 flex items-center gap-2 cursor-pointer"
+                  >
+                    <BookmarkPlus className="w-3.5 h-3.5 text-violet-400 shrink-0" />
+                    <span>Save Style Preset</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setMobileHeaderMenuOpen(false);
+                      setMyStylesModalOpen(true);
+                    }}
+                    className="w-full min-h-[38px] px-2.5 py-1.5 rounded-xl hover:bg-white/[0.06] text-zinc-200 flex items-center gap-2 cursor-pointer"
+                  >
+                    <Layers className="w-3.5 h-3.5 text-violet-400 shrink-0" />
+                    <span>My Saved Styles</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      const next = !Boolean(activeProject.subtitleStyle.showSafeGuides);
+                      handleInteractiveSubtitleStyleUpdate({ showSafeGuides: next }, { immediate: true });
+                      showNotice(next ? 'Safe guides enabled.' : 'Safe guides hidden.');
+                      setMobileHeaderMenuOpen(false);
+                    }}
+                    className="w-full min-h-[38px] px-2.5 py-1.5 rounded-xl hover:bg-white/[0.06] text-zinc-200 flex items-center justify-between gap-2 cursor-pointer"
+                  >
+                    <span className="flex items-center gap-2">
+                      <ShieldCheck className="w-3.5 h-3.5 text-amber-400 shrink-0" />
+                      <span>Safe Area Guides</span>
+                    </span>
+                    {activeProject.subtitleStyle.showSafeGuides && (
+                      <Check className="w-3.5 h-3.5 text-violet-400" />
+                    )}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setMobileHeaderMenuOpen(false);
+                      setCloudModalOpen(true);
+                    }}
+                    className="w-full min-h-[38px] px-2.5 py-1.5 rounded-xl hover:bg-white/[0.06] text-zinc-200 flex items-center gap-2 cursor-pointer"
+                  >
+                    <Archive className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
+                    <span>Local Backup &amp; Storage</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setMobileHeaderMenuOpen(false);
+                      openSettingsPage();
+                    }}
+                    className="w-full min-h-[38px] px-2.5 py-1.5 rounded-xl hover:bg-white/[0.06] text-zinc-200 flex items-center gap-2 cursor-pointer"
+                  >
+                    <Settings className="w-3.5 h-3.5 text-zinc-300 shrink-0" />
+                    <span>Settings</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={async () => {
+                      videoRef.current?.pause();
+                      setActiveTool(null);
+                      setMobileHeaderMenuOpen(false);
+                      await flushPendingSaves(activeProject.id);
+                      updateActiveView('projects');
+                    }}
+                    className="w-full min-h-[38px] px-2.5 py-1.5 rounded-xl hover:bg-white/[0.06] text-zinc-300 flex items-center gap-2 cursor-pointer"
+                  >
+                    <ChevronLeft className="w-3.5 h-3.5 text-zinc-400 shrink-0" />
+                    <span>All Projects</span>
+                  </button>
+                </div>
+              </div>
+            </>
+          )}
+        </header>
+      )}
+
+      {/* Desktop Editor Header & Non-Editor Top Bar */}
+      <header
+        className={`${
+          activeView === 'editor' && activeProject ? 'hidden lg:flex' : 'flex'
+        } h-13 px-2.5 sm:px-4 border-b border-white/[0.08] bg-[#0B0B0F] items-center justify-between gap-2 shrink-0 z-30`}
+      >
         <div className="flex items-center gap-1.5 sm:gap-2.5 min-w-0">
           {activeView !== 'projects' ? (
             <button
@@ -3708,9 +3976,10 @@ export default function App() {
               <button
                 type="button"
                 onClick={() => handleSelectProject(activeProject)}
-                className="min-h-[36px] px-2.5 py-1.5 rounded-xl bg-violet-600/20 hover:bg-violet-600/30 border border-violet-500/40 text-xs font-semibold text-violet-200 whitespace-nowrap shrink-0 cursor-pointer"
+                className="min-h-[36px] px-2 sm:px-2.5 py-1.5 rounded-xl bg-violet-600/20 hover:bg-violet-600/30 border border-violet-500/40 text-xs font-semibold text-violet-200 whitespace-nowrap shrink-0 cursor-pointer"
               >
-                Continue Project
+                <span className="hidden min-[380px]:inline">Continue Project</span>
+                <span className="min-[380px]:hidden">Continue</span>
               </button>
             )
           )}
@@ -3725,7 +3994,7 @@ export default function App() {
               }
               updateActiveView('projects');
             }}
-            className="flex items-center gap-1.5 text-sm sm:text-base font-display font-bold tracking-tight whitespace-nowrap cursor-pointer"
+            className="flex items-center gap-1 text-xs min-[380px]:text-sm sm:text-base font-display font-bold tracking-tight whitespace-nowrap cursor-pointer min-w-0"
           >
             <span className="text-white">RECAP</span>
             <span className="text-violet-400">STUDIO AI</span>
@@ -3888,9 +4157,10 @@ export default function App() {
                 await flushPendingSaves(activeProject.id);
                 updateActiveView('editor', { projectId: activeProject.id });
               }}
-              className="min-h-[38px] px-3 py-1.5 rounded-xl bg-zinc-800 hover:bg-zinc-700 border border-white/[0.08] text-xs font-semibold text-zinc-200 whitespace-nowrap shrink-0 cursor-pointer"
+              className="min-h-[38px] px-2.5 sm:px-3 py-1.5 rounded-xl bg-zinc-800 hover:bg-zinc-700 border border-white/[0.08] text-xs font-semibold text-zinc-200 whitespace-nowrap shrink-0 cursor-pointer"
             >
-              Back to Editor
+              <span className="hidden min-[380px]:inline">Back to Editor</span>
+              <span className="min-[380px]:hidden">Editor</span>
             </button>
           )}
 
@@ -3923,13 +4193,15 @@ export default function App() {
         </div>
       </header>
 
-      {/* 5-Step Pipeline Progress Bar */}
+      {/* 5-Step Pipeline Progress Bar (desktop in editor, all viewports in other pipeline stages) */}
       {activeView !== 'projects' && activeView !== 'settings' && activeProject && (
-        <WorkflowStepperBar
-          steps={pipelineSteps}
-          onSelectStep={handleSelectPipelineStep}
-          compact={activeView === 'editor'}
-        />
+        <div className={activeView === 'editor' ? 'hidden lg:block shrink-0' : 'shrink-0'}>
+          <WorkflowStepperBar
+            steps={pipelineSteps}
+            onSelectStep={handleSelectPipelineStep}
+            compact={activeView === 'editor'}
+          />
+        </div>
       )}
 
       {/* Preset Warnings Banner */}
@@ -4111,7 +4383,13 @@ export default function App() {
       ) : (
         <main className="flex-1 min-h-0 flex flex-col overflow-hidden bg-[#09090B]">
           {/* Upper Area: Video Preview Stage + Docked Desktop Contextual Inspector */}
-          <div className="flex-1 min-h-[210px] flex overflow-hidden">
+          <div
+            className={`${
+              mobilePreviewCollapsed
+                ? 'flex-none lg:flex-1 lg:min-h-[210px]'
+                : 'flex-1 min-h-[190px] lg:min-h-[210px]'
+            } flex overflow-hidden`}
+          >
             {/* Area 1: Video Preview & Playback Controls */}
             <section
               aria-label="Video preview"
@@ -4140,6 +4418,8 @@ export default function App() {
                 onToggleCropEditMode={setCropEditMode}
                 timelineExpanded={timelineExpanded}
                 onToggleTimelineExpanded={() => setTimelineExpanded((v) => !v)}
+                mobileCollapsed={mobilePreviewCollapsed}
+                onToggleMobileCollapsed={() => setMobilePreviewCollapsed((v) => !v)}
                 onAspectRatioChange={handleAspectRatioChange}
                 onOpenSpeedEditor={() => handleOpenTool('edit', 'timing')}
               />
@@ -4240,7 +4520,11 @@ export default function App() {
               } as React.CSSProperties
             }
             className={`${
-              timelineExpanded ? 'h-[320px] sm:h-[360px]' : 'h-[235px] sm:h-[260px]'
+              mobilePreviewCollapsed
+                ? 'flex-1 min-h-[240px] lg:flex-none'
+                : timelineExpanded
+                ? 'h-[300px] sm:h-[340px]'
+                : 'h-[200px] sm:h-[235px]'
             } lg:h-[var(--tl-h)] shrink-0 overflow-hidden flex flex-col`}
           >
             <TimelineEditor
@@ -4256,6 +4540,10 @@ export default function App() {
               onSplitAtPlayhead={handleSplitAtPlayhead}
               onDuplicateSelected={handleDuplicateSelected}
               onDeleteSelected={handleDeleteSelected}
+              onUndo={handleUndo}
+              canUndo={undoStack.length > 0}
+              onRedo={handleRedo}
+              canRedo={redoStack.length > 0}
               expanded={timelineExpanded}
               onToggleExpanded={() => setTimelineExpanded((v) => !v)}
             />
@@ -4272,7 +4560,7 @@ export default function App() {
                 <div
                   role="menu"
                   aria-label="More studio actions"
-                  className="absolute right-2 bottom-24 z-40 w-64 rounded-2xl bg-[#141419] border border-white/[0.12] shadow-2xl p-2 space-y-1 text-xs"
+                  className="absolute right-2 bottom-[6.25rem] z-40 w-[min(16rem,calc(100vw-1rem))] rounded-2xl bg-[#141419] border border-white/[0.12] shadow-2xl p-2 space-y-1 text-xs"
                 >
                   <button
                     type="button"
@@ -4332,7 +4620,7 @@ export default function App() {
             {/* Mobile Contextual Quick Actions */}
             <nav
               aria-label="Contextual actions"
-              className="h-11 px-2 flex items-center gap-1 overflow-x-auto no-scrollbar border-b border-white/[0.06]"
+              className="h-10 px-2 flex items-center gap-1 overflow-x-auto no-scrollbar border-b border-white/[0.06]"
             >
               {contextualSubToolbarItems.map(({ id, label, Icon, active }) => {
                 const isCropActive = id === 'crop' && cropEditMode;
@@ -4343,7 +4631,7 @@ export default function App() {
                     key={`${selectedElement?.kind || 'root'}-${id}`}
                     type="button"
                     onClick={() => handleSubAction(id)}
-                    className={`min-h-[34px] px-2.5 rounded-lg flex items-center gap-1.5 text-[11px] font-medium whitespace-nowrap shrink-0 cursor-pointer ${
+                    className={`min-h-[32px] px-2.5 rounded-lg flex items-center gap-1.5 text-[11px] font-medium whitespace-nowrap shrink-0 cursor-pointer ${
                       isCropActive
                         ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/40'
                         : isHighlight
@@ -4375,7 +4663,7 @@ export default function App() {
                       setInspectorTool(id);
                       setActiveTool((prev) => (prev === id ? null : id));
                     }}
-                    className={`min-w-[58px] min-h-[44px] px-2.5 py-1 rounded-lg border flex flex-col items-center justify-center gap-0.5 text-[10.5px] font-medium whitespace-nowrap shrink-0 cursor-pointer ${
+                    className={`min-w-[54px] min-h-[46px] px-2 py-1 rounded-lg border flex flex-col items-center justify-center gap-0.5 text-[10.5px] font-medium whitespace-nowrap shrink-0 cursor-pointer ${
                       isActive
                         ? 'bg-violet-600/25 border-violet-500 text-white'
                         : 'bg-[#141419] border-white/[0.08] text-zinc-300 hover:text-white'

@@ -5,6 +5,7 @@ import {
   ChevronDown,
   ChevronLeft,
   ChevronRight,
+  ChevronUp,
   Crop,
   Grid,
   Loader2,
@@ -95,6 +96,8 @@ interface VideoStudioPlayerProps {
   onToggleTimelineExpanded?: () => void;
   onAspectRatioChange?: (ratio: CanvasAspectRatio) => void;
   onOpenSpeedEditor?: () => void;
+  mobileCollapsed?: boolean;
+  onToggleMobileCollapsed?: () => void;
 }
 
 type ResizeHandleDir = 'n' | 'ne' | 'e' | 'se' | 's' | 'sw' | 'w' | 'nw';
@@ -342,6 +345,8 @@ export function VideoStudioPlayer({
   onToggleTimelineExpanded,
   onAspectRatioChange,
   onOpenSpeedEditor,
+  mobileCollapsed = false,
+  onToggleMobileCollapsed,
 }: VideoStudioPlayerProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const stageViewportRef = useRef<HTMLDivElement>(null);
@@ -3218,19 +3223,21 @@ export function VideoStudioPlayer({
         ref={stageViewportRef}
         className={
           variant === 'capcut'
-            ? 'relative flex-1 min-h-[160px] bg-[#07070A] flex items-center justify-center p-2 sm:p-3 overflow-hidden'
+            ? mobileCollapsed
+              ? 'relative h-0 min-h-0 p-0 overflow-hidden opacity-0 pointer-events-none lg:opacity-100 lg:pointer-events-auto lg:h-auto lg:flex-1 lg:min-h-[160px] bg-[#07070A] flex items-center justify-center lg:p-3 transition-all duration-150'
+              : 'relative flex-1 min-h-[176px] sm:min-h-[220px] lg:min-h-[160px] bg-[#07070A] flex items-center justify-center p-1.5 sm:p-3 overflow-hidden'
             : 'relative bg-[#060608] flex items-center justify-center p-3 sm:p-4 min-h-[280px] sm:min-h-[380px]'
         }
       >
         {/* CapCut Floating Top-Left Aspect Ratio Selector & Top-Right Stage Controls */}
         {variant === 'capcut' && !readOnlyPreview && (
           <>
-            <div className="absolute top-2.5 left-2.5 z-30">
+            <div className="absolute top-2 left-2 sm:top-2.5 sm:left-2.5 z-30">
               <div className="relative">
                 <button
                   type="button"
                   onClick={() => setAspectMenuOpen((v) => !v)}
-                  className="min-h-[30px] px-2.5 py-1 rounded-lg bg-zinc-900/90 hover:bg-zinc-800 backdrop-blur-sm border border-white/15 text-[11px] font-mono font-semibold text-white flex items-center gap-1 cursor-pointer shadow-lg"
+                  className="min-h-[36px] lg:min-h-[30px] px-2.5 py-1 rounded-lg bg-zinc-900/90 hover:bg-zinc-800 backdrop-blur-sm border border-white/15 text-[11px] font-mono font-semibold text-white flex items-center gap-1 cursor-pointer shadow-lg"
                   title="Change Canvas Aspect Ratio"
                 >
                   <span>{effectiveAspect === 'original' ? 'Original' : effectiveAspect}</span>
@@ -3277,7 +3284,7 @@ export function VideoStudioPlayer({
               </div>
             </div>
 
-            <div className="absolute top-2.5 right-2.5 z-30 flex items-center gap-1.5">
+            <div className="absolute top-2 right-2 sm:top-2.5 sm:right-2.5 z-30 flex items-center gap-1.5">
               {drawMode !== 'none' && (
                 <span className="px-2.5 py-1 rounded-lg bg-violet-600/95 text-[11px] font-medium text-white shadow-lg">
                   Drag on video to draw {drawMode}
@@ -3287,7 +3294,7 @@ export function VideoStudioPlayer({
                 <button
                   type="button"
                   onClick={() => setCropEditActive(false)}
-                  className="min-h-[30px] px-2.5 py-1 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-xs font-semibold text-white flex items-center gap-1 shadow-lg cursor-pointer"
+                  className="min-h-[36px] lg:min-h-[30px] px-2.5 py-1 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-xs font-semibold text-white flex items-center gap-1 shadow-lg cursor-pointer"
                 >
                   <Check className="w-3.5 h-3.5" />
                   <span>Done Crop</span>
@@ -3297,7 +3304,8 @@ export function VideoStudioPlayer({
                 type="button"
                 onClick={() => setShowSafeGuides(!showSafeGuides)}
                 title="Toggle Safe Area Guides"
-                className={`min-h-[30px] min-w-[30px] px-2 py-1 rounded-lg backdrop-blur-sm border text-[11px] font-medium flex items-center justify-center cursor-pointer transition-colors ${
+                aria-label="Toggle Safe Area Guides"
+                className={`min-h-[36px] min-w-[36px] lg:min-h-[30px] lg:min-w-[30px] px-2 py-1 rounded-lg backdrop-blur-sm border text-[11px] font-medium flex items-center justify-center cursor-pointer transition-colors ${
                   showSafeGuides
                     ? 'bg-cyan-500/25 border-cyan-400/50 text-cyan-200'
                     : 'bg-zinc-900/85 border-white/15 text-zinc-300 hover:text-white'
@@ -3309,7 +3317,7 @@ export function VideoStudioPlayer({
                 type="button"
                 onClick={toggleFullscreen}
                 title={isFullscreen ? 'Exit Fullscreen' : 'Fullscreen Preview'}
-                className="min-h-[30px] min-w-[30px] p-1.5 rounded-lg bg-zinc-900/85 hover:bg-zinc-800 backdrop-blur-sm border border-white/15 text-zinc-200 hover:text-white flex items-center justify-center cursor-pointer"
+                className="min-h-[36px] min-w-[36px] lg:min-h-[30px] lg:min-w-[30px] p-1.5 rounded-lg bg-zinc-900/85 hover:bg-zinc-800 backdrop-blur-sm border border-white/15 text-zinc-200 hover:text-white flex items-center justify-center cursor-pointer"
                 aria-label={isFullscreen ? 'Exit Fullscreen' : 'Toggle fullscreen'}
               >
                 {isFullscreen ? <Minimize2 className="w-3.5 h-3.5" /> : <Maximize2 className="w-3.5 h-3.5" />}
@@ -3655,7 +3663,7 @@ export function VideoStudioPlayer({
                 </div>
 
                 {/* Floating Crop Quick Actions Bar */}
-                <div className="mt-2 flex items-center gap-2 bg-[#111115]/95 border border-white/15 rounded-lg px-3 py-1.5 text-[11px] shadow-xl">
+                <div className="mt-2 flex flex-wrap items-center justify-center gap-1.5 sm:gap-2 max-w-full bg-[#111115]/95 border border-white/15 rounded-lg px-2.5 sm:px-3 py-1.5 text-[11px] shadow-xl">
                   <span className="text-zinc-300 font-mono tabular-nums">
                     Crop: {cropRect.cw}×{cropRect.ch}px
                   </span>
@@ -4490,13 +4498,13 @@ export function VideoStudioPlayer({
 
       {/* Transport Controls Bar */}
       {variant === 'capcut' ? (
-        <div className="px-2.5 sm:px-4 h-11 border-t border-white/[0.08] bg-[#111115] flex items-center justify-between gap-2 shrink-0">
+        <div className="px-2 sm:px-4 h-12 lg:h-11 border-t border-white/[0.08] bg-[#111115] flex items-center justify-between gap-1.5 sm:gap-2 shrink-0">
           <div className="flex items-center gap-1 sm:gap-2 min-w-0">
             <button
               type="button"
               onClick={togglePlay}
               disabled={!previewVideoUrl}
-              className="min-w-[36px] min-h-[36px] rounded-lg bg-violet-600 hover:bg-violet-500 disabled:bg-zinc-800 disabled:opacity-40 text-white flex items-center justify-center transition-colors cursor-pointer shrink-0"
+              className="min-w-[40px] min-h-[40px] lg:min-w-[36px] lg:min-h-[36px] rounded-lg bg-violet-600 hover:bg-violet-500 disabled:bg-zinc-800 disabled:opacity-40 text-white flex items-center justify-center transition-colors cursor-pointer shrink-0"
               aria-label={isPlaying ? 'Pause' : 'Play'}
             >
               {isPlaying ? (
@@ -4506,14 +4514,14 @@ export function VideoStudioPlayer({
               )}
             </button>
 
-            <div className="flex items-center gap-0.5">
+            <div className="hidden min-[380px]:flex items-center gap-0.5">
               <button
                 type="button"
                 onClick={() => stepFrame(-1)}
                 disabled={!previewVideoUrl}
                 title="Previous frame"
                 aria-label="Previous frame"
-                className="min-w-[30px] min-h-[30px] p-1 rounded-md text-zinc-400 hover:text-white hover:bg-white/[0.06] disabled:opacity-40 flex items-center justify-center cursor-pointer"
+                className="min-w-[34px] min-h-[36px] lg:min-w-[30px] lg:min-h-[30px] p-1 rounded-md text-zinc-400 hover:text-white hover:bg-white/[0.06] disabled:opacity-40 flex items-center justify-center cursor-pointer"
               >
                 <ChevronLeft className="w-4 h-4" />
               </button>
@@ -4523,25 +4531,25 @@ export function VideoStudioPlayer({
                 disabled={!previewVideoUrl}
                 title="Next frame"
                 aria-label="Next frame"
-                className="min-w-[30px] min-h-[30px] p-1 rounded-md text-zinc-400 hover:text-white hover:bg-white/[0.06] disabled:opacity-40 flex items-center justify-center cursor-pointer"
+                className="min-w-[34px] min-h-[36px] lg:min-w-[30px] lg:min-h-[30px] p-1 rounded-md text-zinc-400 hover:text-white hover:bg-white/[0.06] disabled:opacity-40 flex items-center justify-center cursor-pointer"
               >
                 <ChevronRight className="w-4 h-4" />
               </button>
             </div>
 
-            <div className="font-mono text-xs sm:text-[13px] text-white tabular-nums whitespace-nowrap ml-0.5">
+            <div className="font-mono text-[11px] min-[380px]:text-xs sm:text-[13px] text-white tabular-nums whitespace-nowrap ml-0.5 truncate">
               {formatTimecode(currentTime)}{' '}
               <span className="text-zinc-500">/ {formatTimecode(effectiveDuration)}</span>
             </div>
           </div>
 
-          <div className="flex items-center gap-1.5 sm:gap-2 shrink-0">
+          <div className="flex items-center gap-1 sm:gap-2 shrink-0">
             {Math.abs(activeVideoSpeed - 1.0) > 0.01 && (
               <button
                 type="button"
                 onClick={onOpenSpeedEditor}
                 title="Active video clip speed (narration & other tracks stay 1.0x)"
-                className="min-h-[28px] px-2 py-0.5 rounded-md bg-violet-600/20 border border-violet-500/40 text-[11px] font-mono font-semibold text-violet-200 cursor-pointer"
+                className="min-h-[32px] lg:min-h-[28px] px-1.5 sm:px-2 py-0.5 rounded-md bg-violet-600/20 border border-violet-500/40 text-[11px] font-mono font-semibold text-violet-200 cursor-pointer whitespace-nowrap"
               >
                 {activeVideoSpeed}x
               </button>
@@ -4551,20 +4559,21 @@ export function VideoStudioPlayer({
               type="button"
               onClick={() => setCompareModeActive(!compareModeActive)}
               title={compareModeActive ? 'Showing Raw Unfiltered Video' : 'Compare Before/After Filters'}
-              className={`min-h-[30px] px-2 py-1 rounded-md text-[11px] font-medium cursor-pointer transition-colors ${
+              className={`min-h-[34px] lg:min-h-[30px] px-2 py-1 rounded-md text-[11px] font-medium cursor-pointer transition-colors whitespace-nowrap ${
                 compareModeActive
                   ? 'bg-amber-500/20 text-amber-300 border border-amber-500/40'
                   : 'text-zinc-300 hover:text-white hover:bg-white/[0.06]'
               }`}
             >
-              {compareModeActive ? 'Raw' : 'FX On'}
+              <span className="min-[380px]:hidden">{compareModeActive ? 'Raw' : 'FX'}</span>
+              <span className="hidden min-[380px]:inline">{compareModeActive ? 'Raw' : 'FX On'}</span>
             </button>
 
             <div className="flex items-center gap-1">
               <button
                 type="button"
                 onClick={() => setMuted(!muted)}
-                className="min-w-[32px] min-h-[32px] p-1.5 rounded-lg text-zinc-300 hover:text-white hover:bg-white/[0.06] flex items-center justify-center cursor-pointer"
+                className="min-w-[36px] min-h-[36px] lg:min-w-[32px] lg:min-h-[32px] p-1.5 rounded-lg text-zinc-300 hover:text-white hover:bg-white/[0.06] flex items-center justify-center cursor-pointer"
                 aria-label={muted ? 'Unmute master output' : 'Mute master output'}
                 title={muted ? 'Unmute master output' : 'Mute master output'}
               >
@@ -4589,10 +4598,33 @@ export function VideoStudioPlayer({
               />
             </div>
 
+            {onToggleMobileCollapsed && (
+              <button
+                type="button"
+                onClick={onToggleMobileCollapsed}
+                className={`lg:hidden min-h-[36px] px-2 py-1 rounded-lg border text-[11px] font-medium flex items-center gap-1 cursor-pointer whitespace-nowrap ${
+                  mobileCollapsed
+                    ? 'bg-violet-600/25 border-violet-500/50 text-violet-200'
+                    : 'bg-zinc-900/70 border-white/[0.08] text-zinc-300 hover:text-white'
+                }`}
+                aria-label={mobileCollapsed ? 'Show video preview' : 'Minimize video preview'}
+                title={mobileCollapsed ? 'Show preview' : 'Hide preview to expand timeline'}
+              >
+                {mobileCollapsed ? (
+                  <>
+                    <ChevronDown className="w-3.5 h-3.5" />
+                    <span className="hidden min-[360px]:inline">Video</span>
+                  </>
+                ) : (
+                  <ChevronUp className="w-3.5 h-3.5" />
+                )}
+              </button>
+            )}
+
             <button
               type="button"
               onClick={toggleFullscreen}
-              className="min-w-[32px] min-h-[32px] p-1.5 rounded-lg text-zinc-300 hover:text-white hover:bg-white/[0.06] flex items-center justify-center cursor-pointer"
+              className="min-w-[36px] min-h-[36px] lg:min-w-[32px] lg:min-h-[32px] p-1.5 rounded-lg text-zinc-300 hover:text-white hover:bg-white/[0.06] flex items-center justify-center cursor-pointer"
               aria-label={isFullscreen ? 'Exit fullscreen' : 'Toggle fullscreen'}
               title={isFullscreen ? 'Exit fullscreen' : 'Fullscreen preview'}
             >

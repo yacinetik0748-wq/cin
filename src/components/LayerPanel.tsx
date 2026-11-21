@@ -474,7 +474,7 @@ export function LayerPanel({
                         type="button"
                         onClick={() => moveOverlayOrder(row.token, 'forward')}
                         title="Bring Forward"
-                        className="min-w-[30px] min-h-[30px] flex items-center justify-center text-zinc-400 hover:text-white rounded hover:bg-white/[0.06] cursor-pointer"
+                        className="min-w-[36px] min-h-[36px] lg:min-w-[30px] lg:min-h-[30px] flex items-center justify-center text-zinc-400 hover:text-white rounded hover:bg-white/[0.06] cursor-pointer"
                       >
                         <ArrowUp className="w-3.5 h-3.5" />
                       </button>
@@ -482,7 +482,7 @@ export function LayerPanel({
                         type="button"
                         onClick={() => moveOverlayOrder(row.token, 'backward')}
                         title="Send Backward"
-                        className="min-w-[30px] min-h-[30px] flex items-center justify-center text-zinc-400 hover:text-white rounded hover:bg-white/[0.06] cursor-pointer"
+                        className="min-w-[36px] min-h-[36px] lg:min-w-[30px] lg:min-h-[30px] flex items-center justify-center text-zinc-400 hover:text-white rounded hover:bg-white/[0.06] cursor-pointer"
                       >
                         <ArrowDown className="w-3.5 h-3.5" />
                       </button>
@@ -492,7 +492,7 @@ export function LayerPanel({
                     type="button"
                     onClick={() => toggleVisibility(row)}
                     title={row.visible ? 'Hide layer' : 'Show layer'}
-                    className={`min-w-[30px] min-h-[30px] flex items-center justify-center rounded hover:bg-white/[0.06] cursor-pointer ${
+                    className={`min-w-[36px] min-h-[36px] lg:min-w-[30px] lg:min-h-[30px] flex items-center justify-center rounded hover:bg-white/[0.06] cursor-pointer ${
                       row.visible ? 'text-zinc-300 hover:text-white' : 'text-zinc-600'
                     }`}
                   >
@@ -502,7 +502,7 @@ export function LayerPanel({
                     type="button"
                     onClick={() => toggleLock(row)}
                     title={row.locked ? 'Unlock layer' : 'Lock layer'}
-                    className={`min-w-[30px] min-h-[30px] flex items-center justify-center rounded hover:bg-white/[0.06] cursor-pointer ${
+                    className={`min-w-[36px] min-h-[36px] lg:min-w-[30px] lg:min-h-[30px] flex items-center justify-center rounded hover:bg-white/[0.06] cursor-pointer ${
                       row.locked ? 'text-amber-400' : 'text-zinc-400 hover:text-white'
                     }`}
                   >
@@ -513,7 +513,7 @@ export function LayerPanel({
                       type="button"
                       onClick={() => duplicateLayer(row)}
                       title="Duplicate layer (Ctrl/Cmd+D)"
-                      className="min-w-[30px] min-h-[30px] flex items-center justify-center text-zinc-400 hover:text-white rounded hover:bg-white/[0.06] cursor-pointer"
+                      className="min-w-[36px] min-h-[36px] lg:min-w-[30px] lg:min-h-[30px] flex items-center justify-center text-zinc-400 hover:text-white rounded hover:bg-white/[0.06] cursor-pointer"
                     >
                       <Copy className="w-3.5 h-3.5" />
                     </button>
@@ -523,7 +523,7 @@ export function LayerPanel({
                       type="button"
                       onClick={() => deleteLayer(row)}
                       title="Delete layer"
-                      className="min-w-[30px] min-h-[30px] flex items-center justify-center text-zinc-500 hover:text-red-400 rounded hover:bg-white/[0.06] cursor-pointer"
+                      className="min-w-[36px] min-h-[36px] lg:min-w-[30px] lg:min-h-[30px] flex items-center justify-center text-zinc-500 hover:text-red-400 rounded hover:bg-white/[0.06] cursor-pointer"
                     >
                       <Trash2 className="w-3.5 h-3.5" />
                     </button>
@@ -667,7 +667,7 @@ export function LayerPanel({
                           ),
                         })
                       }
-                      className="min-w-[28px] min-h-[28px] flex items-center justify-center rounded hover:bg-white/[0.06] cursor-pointer"
+                      className="min-w-[34px] min-h-[34px] lg:min-w-[28px] lg:min-h-[28px] flex items-center justify-center rounded hover:bg-white/[0.06] cursor-pointer"
                       title={fl.enabled ? 'Hide filter' : 'Show filter'}
                     >
                       {fl.enabled ? (
@@ -685,7 +685,7 @@ export function LayerPanel({
                           ),
                         })
                       }
-                      className={`min-w-[28px] min-h-[28px] flex items-center justify-center rounded hover:bg-white/[0.06] cursor-pointer ${
+                      className={`min-w-[34px] min-h-[34px] lg:min-w-[28px] lg:min-h-[28px] flex items-center justify-center rounded hover:bg-white/[0.06] cursor-pointer ${
                         fl.locked ? 'text-amber-400' : 'text-zinc-400'
                       }`}
                       title={fl.locked ? 'Unlock' : 'Lock'}
@@ -705,7 +705,7 @@ export function LayerPanel({
                         onUpdateVideoEffects({ filterStack: [...filterStack, copy] });
                         onSelectElement({ kind: 'filter', filterId: copy.id });
                       }}
-                      className="min-w-[28px] min-h-[28px] flex items-center justify-center text-zinc-400 hover:text-white disabled:opacity-35 rounded hover:bg-white/[0.06] cursor-pointer"
+                      className="min-w-[34px] min-h-[34px] lg:min-w-[28px] lg:min-h-[28px] flex items-center justify-center text-zinc-400 hover:text-white disabled:opacity-35 rounded hover:bg-white/[0.06] cursor-pointer"
                       title="Duplicate"
                     >
                       <Copy className="w-3.5 h-3.5" />
@@ -719,7 +719,7 @@ export function LayerPanel({
                         });
                         if (isSel) onSelectElement(null);
                       }}
-                      className="min-w-[28px] min-h-[28px] flex items-center justify-center text-zinc-500 hover:text-red-400 disabled:opacity-35 rounded hover:bg-white/[0.06] cursor-pointer"
+                      className="min-w-[34px] min-h-[34px] lg:min-w-[28px] lg:min-h-[28px] flex items-center justify-center text-zinc-500 hover:text-red-400 disabled:opacity-35 rounded hover:bg-white/[0.06] cursor-pointer"
                       title="Delete"
                     >
                       <Trash2 className="w-3.5 h-3.5" />
@@ -766,7 +766,7 @@ export function LayerPanel({
                           ),
                         })
                       }
-                      className="min-w-[28px] min-h-[28px] flex items-center justify-center rounded hover:bg-white/[0.06] cursor-pointer"
+                      className="min-w-[34px] min-h-[34px] lg:min-w-[28px] lg:min-h-[28px] flex items-center justify-center rounded hover:bg-white/[0.06] cursor-pointer"
                       title={fx.enabled ? 'Hide effect' : 'Show effect'}
                     >
                       {fx.enabled ? (
@@ -784,7 +784,7 @@ export function LayerPanel({
                           ),
                         })
                       }
-                      className={`min-w-[28px] min-h-[28px] flex items-center justify-center rounded hover:bg-white/[0.06] cursor-pointer ${
+                      className={`min-w-[34px] min-h-[34px] lg:min-w-[28px] lg:min-h-[28px] flex items-center justify-center rounded hover:bg-white/[0.06] cursor-pointer ${
                         fx.locked ? 'text-amber-400' : 'text-zinc-400'
                       }`}
                       title={fx.locked ? 'Unlock' : 'Lock'}
@@ -804,7 +804,7 @@ export function LayerPanel({
                         onUpdateVideoEffects({ effects: [...effectsList, copy] });
                         onSelectElement({ kind: 'effect', effectId: copy.id });
                       }}
-                      className="min-w-[28px] min-h-[28px] flex items-center justify-center text-zinc-400 hover:text-white disabled:opacity-35 rounded hover:bg-white/[0.06] cursor-pointer"
+                      className="min-w-[34px] min-h-[34px] lg:min-w-[28px] lg:min-h-[28px] flex items-center justify-center text-zinc-400 hover:text-white disabled:opacity-35 rounded hover:bg-white/[0.06] cursor-pointer"
                       title="Duplicate"
                     >
                       <Copy className="w-3.5 h-3.5" />
@@ -818,7 +818,7 @@ export function LayerPanel({
                         });
                         if (isSel) onSelectElement(null);
                       }}
-                      className="min-w-[28px] min-h-[28px] flex items-center justify-center text-zinc-500 hover:text-red-400 disabled:opacity-35 rounded hover:bg-white/[0.06] cursor-pointer"
+                      className="min-w-[34px] min-h-[34px] lg:min-w-[28px] lg:min-h-[28px] flex items-center justify-center text-zinc-500 hover:text-red-400 disabled:opacity-35 rounded hover:bg-white/[0.06] cursor-pointer"
                       title="Delete"
                     >
                       <Trash2 className="w-3.5 h-3.5" />

@@ -1611,7 +1611,7 @@ export function CaptionsToolSheet({
               )}
               <div>
                 <label className="text-[11px] text-zinc-400">Highlight Behavior</label>
-                <div className="mt-1 grid grid-cols-5 gap-1 bg-zinc-900 p-0.5 rounded-lg">
+                <div className="mt-1 grid grid-cols-3 min-[360px]:grid-cols-5 gap-1 bg-zinc-900 p-0.5 rounded-lg">
                   {(['color', 'box', 'scale', 'underline', 'glow'] as CaptionHighlightBehavior[]).map(
                     (hb) => (
                       <button

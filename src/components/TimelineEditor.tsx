@@ -8,15 +8,18 @@ import {
   EyeOff,
   Film,
   Layers,
+  Layers3,
   Maximize2,
   Mic,
   Minimize2,
   Music,
   Plus,
+  Redo2,
   Scissors,
   Sparkles,
   Trash2,
   Type,
+  Undo2,
   Unlink,
   Volume2,
   VolumeX,
@@ -74,6 +77,10 @@ interface TimelineEditorProps {
   onSplitAtPlayhead?: () => void;
   onDuplicateSelected?: () => void;
   onDeleteSelected?: () => void;
+  onUndo?: () => void;
+  canUndo?: boolean;
+  onRedo?: () => void;
+  canRedo?: boolean;
   expanded?: boolean;
   onToggleExpanded?: () => void;
 }
@@ -194,11 +201,16 @@ export function TimelineEditor({
   onSplitAtPlayhead,
   onDuplicateSelected,
   onDeleteSelected,
+  onUndo,
+  canUndo = false,
+  onRedo,
+  canRedo = false,
   expanded = false,
   onToggleExpanded,
 }: TimelineEditorProps) {
   const [zoom, setZoom] = useState(1);
   const [density, setDensity] = useState<TrackDensity>('standard');
+  const [mobileShowAllTracks, setMobileShowAllTracks] = useState(false);
   const [filmstripFrames, setFilmstripFrames] = useState<FilmstripFrame[]>([]);
   const [audioWaveforms, setAudioWaveforms] = useState<ProjectAudioWaveforms | null>(null);
   const [dragTooltip, setDragTooltip] = useState<{ xPct: number; label: string } | null>(null);
@@ -407,10 +419,26 @@ export function TimelineEditor({
     [duration, onSeek]
   );
 
-  const handleTrackPointerDown = (e: React.PointerEvent<HTMLDivElement>) => {
+  const handleRulerPointerDown = (e: React.PointerEvent<HTMLDivElement>) => {
     if (e.button !== 0) return;
     scrubbingRef.current = true;
     (e.currentTarget as HTMLElement).setPointerCapture?.(e.pointerId);
+    seekFromClientX(e.clientX);
+  };
+
+  const handleTrackPointerDown = (e: React.PointerEvent<HTMLDivElement>) => {
+    if (e.button !== 0) return;
+    if (e.pointerType === 'touch') {
+      // Allow native touch scrolling across track lanes; ruler scrubbing handles touch dragging
+      return;
+    }
+    scrubbingRef.current = true;
+    (e.currentTarget as HTMLElement).setPointerCapture?.(e.pointerId);
+    seekFromClientX(e.clientX);
+  };
+
+  const handleTrackClick = (e: React.MouseEvent<HTMLDivElement>) => {
+    if (suppressClickRef.current || clipDragRef.current) return;
     seekFromClientX(e.clientX);
   };
 
@@ -1038,20 +1066,123 @@ export function TimelineEditor({
         (selectedElement.kind === 'effect' && Boolean(selectedElement.effectId)))
   );
 
+  const showCaptionsLane =
+    mobileShowAllTracks ||
+    syncedCaptions.length > 0 ||
+    project.subtitleStyle.enabled ||
+    selectedElement?.kind === 'captions';
+  const showNarrationLane =
+    mobileShowAllTracks ||
+    hasDubAudio ||
+    (selectedElement?.kind === 'audio' && (!selectedElement.track || selectedElement.track === 'dub'));
+  const showOrigAudioLane =
+    mobileShowAllTracks ||
+    hasUnlinkedAudio ||
+    !origTrackMuted ||
+    (selectedElement?.kind === 'audio' && selectedElement.track === 'orig');
+  const showMusicLane =
+    mobileShowAllTracks ||
+    bgmClips.length > 0 ||
+    Boolean(project.voice.bgMusicUrl) ||
+    (selectedElement?.kind === 'audio' && selectedElement.track === 'bgm');
+  const showSfxLane =
+    mobileShowAllTracks ||
+    sfxClips.length > 0 ||
+    Boolean(project.voice.sfxUrl) ||
+    (selectedElement?.kind === 'audio' && selectedElement.track === 'sfx');
+  const showOverlaysLane =
+    mobileShowAllTracks ||
+    project.logos.length > 0 ||
+    (project.subtitleStyle.extraElements || []).length > 0 ||
+    selectedElement?.kind === 'logo' ||
+    selectedElement?.kind === 'caption-element';
+  const showBlurLane =
+    mobileShowAllTracks || project.blurs.length > 0 || selectedElement?.kind === 'blur';
+  const showFiltersLane =
+    mobileShowAllTracks ||
+    filterStack.length > 0 ||
+    fxConfig.filterPreset !== 'none' ||
+    selectedElement?.kind === 'filter';
+  const showEffectsLane =
+    mobileShowAllTracks ||
+    allVisualEffects.length > 0 ||
+    selectedElement?.kind === 'effect';
+
+  const activeMobileTrackCount =
+    1 +
+    (showCaptionsLane ? 1 : 0) +
+    (showNarrationLane ? 1 : 0) +
+    (showOrigAudioLane ? 1 : 0) +
+    (showMusicLane ? 1 : 0) +
+    (showSfxLane ? 1 : 0) +
+    (showOverlaysLane ? 1 : 0) +
+    (showBlurLane ? 1 : 0) +
+    (showFiltersLane ? 1 : 0) +
+    (showEffectsLane ? 1 : 0);
+
   return (
     <div
       onWheel={handleWheelZoom}
       className="h-full bg-[#0C0C11] border-t border-white/[0.08] flex flex-col select-none overflow-hidden"
     >
       {/* Timeline Utility Toolbar */}
-      <div className="h-10 px-2.5 sm:px-3 border-b border-white/[0.08] bg-[#121218] flex items-center justify-between gap-2 shrink-0">
-        {/* Left: Direct Clip Actions + Playhead Readout */}
-        <div className="flex items-center gap-1.5 min-w-0">
+      <div className="h-11 lg:h-10 px-2 sm:px-3 border-b border-white/[0.08] bg-[#121218] flex items-center justify-between gap-1.5 sm:gap-2 shrink-0 overflow-x-auto no-scrollbar">
+        {/* Left: Direct Clip Actions + Mobile Track Drawer + Playhead Readout */}
+        <div className="flex items-center gap-1 sm:gap-1.5 shrink-0">
           <div className="hidden sm:flex items-center gap-1.5 pr-2 mr-1 border-r border-white/[0.08] font-mono text-[11px] text-zinc-200 tabular-nums shrink-0">
             <span>{formatTimecode(currentTime)}</span>
             <span className="text-zinc-600">/</span>
             <span className="text-zinc-400">{formatTimecode(duration)}</span>
           </div>
+
+          <button
+            type="button"
+            onClick={() => openTool('layers')}
+            title="Manage Tracks & Layers"
+            className="lg:hidden min-h-[34px] px-2 py-1 rounded-md bg-[#1A1A24] hover:bg-violet-600/25 border border-white/[0.1] text-[11px] font-medium text-zinc-100 flex items-center gap-1 cursor-pointer shrink-0 whitespace-nowrap"
+          >
+            <Layers3 className="w-3.5 h-3.5 text-violet-400 shrink-0" />
+            <span>Tracks</span>
+          </button>
+
+          <button
+            type="button"
+            onClick={() => setMobileShowAllTracks((v) => !v)}
+            title={mobileShowAllTracks ? 'Show active tracks only' : 'Show all 10 tracks'}
+            className={`lg:hidden min-h-[34px] px-2 py-1 rounded-md border text-[11px] font-mono font-medium flex items-center gap-1 cursor-pointer shrink-0 whitespace-nowrap ${
+              mobileShowAllTracks
+                ? 'bg-violet-600/25 border-violet-500/50 text-violet-200'
+                : 'bg-[#17171F] border-white/[0.08] text-zinc-300'
+            }`}
+          >
+            <span>{mobileShowAllTracks ? '10/10' : `${activeMobileTrackCount}/10`}</span>
+          </button>
+
+          {onUndo && (
+            <button
+              type="button"
+              onClick={onUndo}
+              disabled={!canUndo}
+              title="Undo"
+              aria-label="Undo"
+              className="lg:hidden min-w-[34px] min-h-[34px] p-1 rounded-md bg-[#1A1A22] hover:bg-[#24242F] disabled:opacity-30 border border-white/[0.08] text-zinc-200 flex items-center justify-center cursor-pointer shrink-0"
+            >
+              <Undo2 className="w-3.5 h-3.5" />
+            </button>
+          )}
+
+          {onRedo && (
+            <button
+              type="button"
+              onClick={onRedo}
+              disabled={!canRedo}
+              title="Redo"
+              aria-label="Redo"
+              className="lg:hidden min-w-[34px] min-h-[34px] p-1 rounded-md bg-[#1A1A22] hover:bg-[#24242F] disabled:opacity-30 border border-white/[0.08] text-zinc-200 flex items-center justify-center cursor-pointer shrink-0"
+            >
+              <Redo2 className="w-3.5 h-3.5" />
+            </button>
+          )}
 
           {onSplitAtPlayhead && (
             <button
@@ -1059,7 +1190,7 @@ export function TimelineEditor({
               onClick={onSplitAtPlayhead}
               disabled={!canSplit}
               title="Split selected clip at playhead"
-              className="min-h-[30px] px-2 py-1 rounded-md bg-[#1A1A22] hover:bg-[#24242F] disabled:opacity-35 border border-white/[0.08] text-[11px] font-medium text-zinc-200 flex items-center gap-1 cursor-pointer shrink-0"
+              className="min-h-[34px] lg:min-h-[30px] px-2 py-1 rounded-md bg-[#1A1A22] hover:bg-[#24242F] disabled:opacity-35 border border-white/[0.08] text-[11px] font-medium text-zinc-200 flex items-center gap-1 cursor-pointer shrink-0 whitespace-nowrap"
             >
               <Scissors className="w-3.5 h-3.5 text-zinc-300" />
               <span className="hidden sm:inline">Split</span>
@@ -1072,7 +1203,7 @@ export function TimelineEditor({
               onClick={onDuplicateSelected}
               disabled={!canDuplicate}
               title="Duplicate selected clip"
-              className="min-h-[30px] px-2 py-1 rounded-md bg-[#1A1A22] hover:bg-[#24242F] disabled:opacity-35 border border-white/[0.08] text-[11px] font-medium text-zinc-200 flex items-center gap-1 cursor-pointer shrink-0"
+              className="min-h-[34px] lg:min-h-[30px] px-2 py-1 rounded-md bg-[#1A1A22] hover:bg-[#24242F] disabled:opacity-35 border border-white/[0.08] text-[11px] font-medium text-zinc-200 flex items-center gap-1 cursor-pointer shrink-0 whitespace-nowrap"
             >
               <Copy className="w-3.5 h-3.5 text-zinc-300" />
               <span className="hidden md:inline">Duplicate</span>
@@ -1085,7 +1216,7 @@ export function TimelineEditor({
               onClick={onDeleteSelected}
               disabled={!canDelete}
               title="Delete selected item"
-              className="min-h-[30px] px-2 py-1 rounded-md bg-[#1A1A22] hover:bg-red-500/20 disabled:opacity-35 border border-white/[0.08] text-[11px] font-medium text-red-300 flex items-center gap-1 cursor-pointer shrink-0"
+              className="min-h-[34px] lg:min-h-[30px] px-2 py-1 rounded-md bg-[#1A1A22] hover:bg-red-500/20 disabled:opacity-35 border border-white/[0.08] text-[11px] font-medium text-red-300 flex items-center gap-1 cursor-pointer shrink-0 whitespace-nowrap"
             >
               <Trash2 className="w-3.5 h-3.5" />
               <span className="hidden md:inline">Delete</span>
@@ -1100,7 +1231,7 @@ export function TimelineEditor({
                 openTool('edit', 'timing');
               }}
               title={mismatches[0].message}
-              className={`min-w-0 max-w-[220px] truncate px-2 py-1 rounded-md text-[10.5px] font-medium flex items-center gap-1 cursor-pointer ${
+              className={`min-w-0 max-w-[160px] sm:max-w-[220px] truncate px-2 py-1 rounded-md text-[10.5px] font-medium flex items-center gap-1 cursor-pointer shrink-0 ${
                 mismatches[0].severity === 'warning'
                   ? 'bg-amber-500/15 border border-amber-500/35 text-amber-200'
                   : 'bg-sky-500/15 border border-sky-500/35 text-sky-200'
@@ -1143,12 +1274,12 @@ export function TimelineEditor({
             ))}
           </div>
 
-          <div className="flex items-center gap-1 bg-[#181820] border border-white/[0.08] rounded-md px-1.5 py-0.5">
+          <div className="flex items-center gap-0.5 sm:gap-1 bg-[#181820] border border-white/[0.08] rounded-md px-1 sm:px-1.5 py-0.5">
             <button
               type="button"
               onClick={() => setZoom((z) => Math.max(1, Number((z - 0.5).toFixed(2))))}
               disabled={zoom <= 1}
-              className="w-6 h-6 rounded text-zinc-400 hover:text-white disabled:opacity-30 flex items-center justify-center cursor-pointer"
+              className="w-7 h-7 lg:w-6 lg:h-6 rounded text-zinc-400 hover:text-white disabled:opacity-30 flex items-center justify-center cursor-pointer"
               title="Zoom out timeline"
               aria-label="Zoom out timeline"
             >
@@ -1164,14 +1295,14 @@ export function TimelineEditor({
               aria-label="Timeline zoom"
               className="hidden md:block w-20 accent-violet-500 cursor-pointer"
             />
-            <span className="text-[10.5px] font-mono text-zinc-300 tabular-nums w-8 text-center">
+            <span className="text-[10.5px] font-mono text-zinc-300 tabular-nums w-7 sm:w-8 text-center">
               {zoom}x
             </span>
             <button
               type="button"
               onClick={() => setZoom((z) => Math.min(8, Number((z + 0.5).toFixed(2))))}
               disabled={zoom >= 8}
-              className="w-6 h-6 rounded text-zinc-400 hover:text-white disabled:opacity-30 flex items-center justify-center cursor-pointer"
+              className="w-7 h-7 lg:w-6 lg:h-6 rounded text-zinc-400 hover:text-white disabled:opacity-30 flex items-center justify-center cursor-pointer"
               title="Zoom in timeline"
               aria-label="Zoom in timeline"
             >
@@ -1181,7 +1312,7 @@ export function TimelineEditor({
               <button
                 type="button"
                 onClick={() => setZoom(1)}
-                className="px-1.5 h-6 rounded bg-white/[0.06] hover:bg-white/[0.12] text-[10px] font-medium text-zinc-200 cursor-pointer"
+                className="px-1.5 h-6 rounded bg-white/[0.06] hover:bg-white/[0.12] text-[10px] font-medium text-zinc-200 cursor-pointer whitespace-nowrap"
                 title="Fit timeline to window"
               >
                 Fit
@@ -1193,7 +1324,7 @@ export function TimelineEditor({
             <button
               type="button"
               onClick={onToggleExpanded}
-              className="min-w-[30px] min-h-[30px] p-1 rounded-md bg-[#1A1A22] hover:bg-[#24242F] border border-white/[0.08] text-zinc-300 hover:text-white flex items-center justify-center cursor-pointer"
+              className="min-w-[34px] min-h-[34px] lg:min-w-[30px] lg:min-h-[30px] p-1 rounded-md bg-[#1A1A22] hover:bg-[#24242F] border border-white/[0.08] text-zinc-300 hover:text-white flex items-center justify-center cursor-pointer shrink-0"
               title={expanded ? 'Collapse timeline' : 'Expand timeline'}
               aria-label={expanded ? 'Collapse timeline' : 'Expand timeline'}
             >
@@ -1203,14 +1334,14 @@ export function TimelineEditor({
         </div>
       </div>
 
-      {/* 3-Column Timeline Shell: Fixed Left Labels | Scrollable Center Ruler & Tracks | Dedicated Right Add Track Column */}
+      {/* 3-Column Timeline Shell on Desktop (>= lg) | Full-Width Track Canvas on Mobile (< lg) */}
       <div className="flex-1 min-h-0 flex overflow-hidden relative">
-        {/* LEFT: FIXED TRACK LABELS COLUMN */}
+        {/* LEFT: FIXED TRACK LABELS COLUMN (Desktop only >= lg) */}
         <div
           ref={leftColRef}
           onScroll={(e) => syncVerticalFromSide(e.currentTarget)}
           style={centerHScrollbarPx > 0 ? { paddingBottom: `${centerHScrollbarPx}px` } : undefined}
-          className="w-[132px] sm:w-[148px] shrink-0 bg-[#121218] border-r border-white/[0.09] overflow-y-auto overflow-x-hidden no-scrollbar flex flex-col"
+          className="hidden lg:flex w-[148px] shrink-0 bg-[#121218] border-r border-white/[0.09] overflow-y-auto overflow-x-hidden no-scrollbar flex-col"
         >
           {/* Corner Sticky Header aligned with Time Ruler (h-7) */}
           <div className="sticky top-0 z-40 h-7 shrink-0 bg-[#14141B] border-b border-white/[0.08] px-2.5 flex items-center justify-between">
@@ -1632,7 +1763,7 @@ export function TimelineEditor({
         <div
           ref={scrollContainerRef}
           onScroll={syncVerticalFromCenter}
-          className="flex-1 min-w-0 overflow-auto relative bg-[#0C0C11]"
+          className="flex-1 min-w-0 overflow-auto overscroll-contain relative bg-[#0C0C11]"
         >
           <div
             className="flex min-h-full"
@@ -1640,18 +1771,18 @@ export function TimelineEditor({
           >
             {/* Left edge gutter inside scrollable canvas */}
             <div className="w-1.5 shrink-0 flex flex-col">
-              <div className="sticky top-0 z-20 h-7 shrink-0 bg-[#14141B] border-b border-white/[0.08]" />
+              <div className="sticky top-0 z-20 h-8 lg:h-7 shrink-0 bg-[#14141B] border-b border-white/[0.08]" />
             </div>
 
             {/* Unified 0%..100% Coordinate Box for Time Ruler, Playhead & All Track Lanes */}
             <div ref={trackAreaRef} className="flex-1 min-w-0 relative flex flex-col">
               {/* Sticky Interactive Time Ruler */}
               <div
-                onPointerDown={handleTrackPointerDown}
+                onPointerDown={handleRulerPointerDown}
                 onPointerMove={handleTrackPointerMove}
                 onPointerUp={handleTrackPointerUp}
                 onPointerCancel={handleTrackPointerUp}
-                className="sticky top-0 z-20 h-7 shrink-0 border-b border-white/[0.08] bg-[#14141B] cursor-ew-resize touch-none overflow-hidden"
+                className="sticky top-0 z-20 h-8 lg:h-7 shrink-0 border-b border-white/[0.08] bg-[#14141B] cursor-ew-resize touch-none overflow-hidden"
               >
                 {timeMarkers.minors.map((t) => {
                   const leftPct = (t / Math.max(0.01, duration)) * 100;
@@ -1682,12 +1813,12 @@ export function TimelineEditor({
                 })}
               </div>
 
-              {/* White Playhead Needle + Line across Ruler & All 9 Lanes */}
+              {/* White Playhead Needle + Line across Ruler & All Lanes */}
               <div
                 className="absolute top-0 bottom-0 -ml-[1px] w-[2px] bg-white z-30 pointer-events-none shadow-[0_0_8px_rgba(255,255,255,0.65)]"
                 style={{ left: `${playheadPct}%` }}
               >
-                <div className="sticky top-0 w-3 h-3.5 -ml-[5px] bg-white [clip-path:polygon(0_0,100%_0,100%_60%,50%_100%,0_60%)]" />
+                <div className="sticky top-0 w-4 h-4 -ml-[7px] lg:w-3 lg:h-3.5 lg:-ml-[5px] bg-white [clip-path:polygon(0_0,100%_0,100%_60%,50%_100%,0_60%)]" />
               </div>
 
               {/* Live Duration & Timing Tooltip while Trimming or Moving */}
@@ -1702,7 +1833,7 @@ export function TimelineEditor({
                 </div>
               )}
 
-              {/* 9 Track Lanes — All sharing exact 0%..100% bounds */}
+              {/* 10 Track Lanes — All sharing exact 0%..100% bounds */}
               <div className="py-1.5 space-y-1.5">
                 {/* Lane 1: Video Track with Real FFmpeg Filmstrip Thumbnails */}
                 <div
@@ -1710,8 +1841,10 @@ export function TimelineEditor({
                   onPointerDown={handleTrackPointerDown}
                   onPointerMove={handleTrackPointerMove}
                   onPointerUp={handleTrackPointerUp}
-                  className="relative rounded-lg overflow-hidden bg-[#13131A] border border-white/[0.06] touch-none"
+                  onClick={handleTrackClick}
+                  className="relative rounded-lg overflow-clip bg-[#13131A] border border-white/[0.06] touch-pan-x touch-pan-y"
                 >
+                  <MobileTrackMicroBadge label="Video" dotClass="bg-violet-400" />
                   {videoClips.map((clip, idx) => {
                     const clipEnd = getVideoClipTimelineEnd(clip);
                     const clipDur = getVideoClipTimelineDuration(clip);
@@ -1873,10 +2006,12 @@ export function TimelineEditor({
                 onPointerDown={handleTrackPointerDown}
                 onPointerMove={handleTrackPointerMove}
                 onPointerUp={handleTrackPointerUp}
-                className={`relative rounded-lg bg-[#13131A] border overflow-hidden cursor-pointer ${
-                  isCaptionTrackSelected ? 'border-amber-400/50' : 'border-white/[0.05]'
-                }`}
+                onClick={handleTrackClick}
+                className={`relative rounded-lg bg-[#13131A] border overflow-clip cursor-pointer touch-pan-x touch-pan-y ${
+                  showCaptionsLane ? 'block' : 'hidden lg:block'
+                } ${isCaptionTrackSelected ? 'border-amber-400/50' : 'border-white/[0.05]'}`}
               >
+                <MobileTrackMicroBadge label="Captions" dotClass="bg-amber-400" />
                 {syncedCaptions.map((cap, idx) => {
                   const left = (cap.syncedStart / duration) * 100;
                   const width = Math.max(2, ((cap.syncedEnd - cap.syncedStart) / duration) * 100);
@@ -1977,13 +2112,17 @@ export function TimelineEditor({
                 onPointerDown={handleTrackPointerDown}
                 onPointerMove={handleTrackPointerMove}
                 onPointerUp={handleTrackPointerUp}
-                className={`relative rounded-lg bg-[#13131A] border overflow-hidden cursor-pointer ${
+                onClick={handleTrackClick}
+                className={`relative rounded-lg bg-[#13131A] border overflow-clip cursor-pointer touch-pan-x touch-pan-y ${
+                  showNarrationLane ? 'block' : 'hidden lg:block'
+                } ${
                   selectedElement?.kind === 'audio' &&
                   (!selectedElement.track || selectedElement.track === 'dub')
                     ? 'border-teal-400/60'
                     : 'border-white/[0.05]'
                 }`}
               >
+                <MobileTrackMicroBadge label="Narration" dotClass="bg-teal-400" />
                 {project.voice.generatedClips.length > 0 ? (
                   project.voice.generatedClips.map((clip) => {
                     const left = (clip.start / duration) * 100;
@@ -2135,12 +2274,16 @@ export function TimelineEditor({
                 onPointerDown={handleTrackPointerDown}
                 onPointerMove={handleTrackPointerMove}
                 onPointerUp={handleTrackPointerUp}
-                className={`relative rounded-lg bg-[#13131A] border overflow-hidden cursor-pointer ${
+                onClick={handleTrackClick}
+                className={`relative rounded-lg bg-[#13131A] border overflow-clip cursor-pointer touch-pan-x touch-pan-y ${
+                  showOrigAudioLane ? 'block' : 'hidden lg:block'
+                } ${
                   selectedElement?.kind === 'audio' && selectedElement.track === 'orig'
                     ? 'border-cyan-400/60'
                     : 'border-white/[0.05]'
                 }`}
               >
+                <MobileTrackMicroBadge label="Orig Audio" dotClass="bg-cyan-400" />
                 {project.sourceVideoUrl ? (
                   hasUnlinkedAudio ? (
                     originalAudioClips.map((oa, idx) => {
@@ -2323,12 +2466,16 @@ export function TimelineEditor({
                 onPointerDown={handleTrackPointerDown}
                 onPointerMove={handleTrackPointerMove}
                 onPointerUp={handleTrackPointerUp}
-                className={`relative rounded-lg bg-[#13131A] border overflow-hidden cursor-pointer ${
+                onClick={handleTrackClick}
+                className={`relative rounded-lg bg-[#13131A] border overflow-clip cursor-pointer touch-pan-x touch-pan-y ${
+                  showMusicLane ? 'block' : 'hidden lg:block'
+                } ${
                   selectedElement?.kind === 'audio' && selectedElement.track === 'bgm'
                     ? 'border-indigo-400/60'
                     : 'border-white/[0.05]'
                 }`}
               >
+                <MobileTrackMicroBadge label="Music" dotClass="bg-indigo-400" />
                 {bgmClips.length > 0 ? (
                   bgmClips.map((bc, idx) => {
                     const bcEnd = getTimelineAudioClipEnd(bc);
@@ -2462,12 +2609,16 @@ export function TimelineEditor({
                 onPointerDown={handleTrackPointerDown}
                 onPointerMove={handleTrackPointerMove}
                 onPointerUp={handleTrackPointerUp}
-                className={`relative rounded-lg bg-[#13131A] border overflow-hidden cursor-pointer ${
+                onClick={handleTrackClick}
+                className={`relative rounded-lg bg-[#13131A] border overflow-clip cursor-pointer touch-pan-x touch-pan-y ${
+                  showSfxLane ? 'block' : 'hidden lg:block'
+                } ${
                   selectedElement?.kind === 'audio' && selectedElement.track === 'sfx'
                     ? 'border-emerald-400/60'
                     : 'border-white/[0.05]'
                 }`}
               >
+                <MobileTrackMicroBadge label="SFX" dotClass="bg-emerald-400" />
                 {sfxClips.length > 0 ? (
                   sfxClips.map((sc, idx) => {
                     const scEnd = getTimelineAudioClipEnd(sc);
@@ -2601,12 +2752,16 @@ export function TimelineEditor({
                 onPointerDown={handleTrackPointerDown}
                 onPointerMove={handleTrackPointerMove}
                 onPointerUp={handleTrackPointerUp}
-                className={`relative rounded-lg bg-[#13131A] border overflow-hidden cursor-pointer ${
+                onClick={handleTrackClick}
+                className={`relative rounded-lg bg-[#13131A] border overflow-clip cursor-pointer touch-pan-x touch-pan-y ${
+                  showOverlaysLane ? 'block' : 'hidden lg:block'
+                } ${
                   selectedElement?.kind === 'logo' || selectedElement?.kind === 'caption-element'
                     ? 'border-purple-400/60'
                     : 'border-white/[0.05]'
                 }`}
               >
+                <MobileTrackMicroBadge label="Overlays" dotClass="bg-purple-400" />
                 {project.logos.map((logo) => {
                   const start = logo.permanent ? 0 : logo.startTime;
                   const end = logo.permanent ? duration : logo.endTime;
@@ -2779,10 +2934,14 @@ export function TimelineEditor({
                 onPointerDown={handleTrackPointerDown}
                 onPointerMove={handleTrackPointerMove}
                 onPointerUp={handleTrackPointerUp}
-                className={`relative rounded-lg bg-[#13131A] border overflow-hidden cursor-pointer ${
+                onClick={handleTrackClick}
+                className={`relative rounded-lg bg-[#13131A] border overflow-clip cursor-pointer touch-pan-x touch-pan-y ${
+                  showBlurLane ? 'block' : 'hidden lg:block'
+                } ${
                   selectedElement?.kind === 'blur' ? 'border-sky-400/60' : 'border-white/[0.05]'
                 }`}
               >
+                <MobileTrackMicroBadge label="Blur" dotClass="bg-sky-400" />
                 {project.blurs.map((blur) => {
                   const isLinked = Boolean(blur.subtitleLink && blur.subtitleLink.mode !== 'manual');
                   const intervals = resolveBlurIntervals(blur, project, {
@@ -2906,10 +3065,14 @@ export function TimelineEditor({
                 onPointerDown={handleTrackPointerDown}
                 onPointerMove={handleTrackPointerMove}
                 onPointerUp={handleTrackPointerUp}
-                className={`relative rounded-lg bg-[#13131A] border overflow-hidden cursor-pointer ${
+                onClick={handleTrackClick}
+                className={`relative rounded-lg bg-[#13131A] border overflow-clip cursor-pointer touch-pan-x touch-pan-y ${
+                  showFiltersLane ? 'block' : 'hidden lg:block'
+                } ${
                   selectedElement?.kind === 'filter' ? 'border-pink-400/60' : 'border-white/[0.05]'
                 }`}
               >
+                <MobileTrackMicroBadge label="Filters" dotClass="bg-pink-400" />
                 {filterStack.map((fl) => {
                   const start = Math.max(0, fl.startTime || 0);
                   const end = fl.endTime > start ? fl.endTime : duration;
@@ -3032,10 +3195,14 @@ export function TimelineEditor({
                 onPointerDown={handleTrackPointerDown}
                 onPointerMove={handleTrackPointerMove}
                 onPointerUp={handleTrackPointerUp}
-                className={`relative rounded-lg bg-[#13131A] border overflow-hidden cursor-pointer ${
+                onClick={handleTrackClick}
+                className={`relative rounded-lg bg-[#13131A] border overflow-clip cursor-pointer touch-pan-x touch-pan-y ${
+                  showEffectsLane ? 'block' : 'hidden lg:block'
+                } ${
                   selectedElement?.kind === 'effect' ? 'border-fuchsia-400/60' : 'border-white/[0.05]'
                 }`}
               >
+                <MobileTrackMicroBadge label="Effects" dotClass="bg-fuchsia-400" />
                 {allVisualEffects.map((fx) => {
                   const start = Math.max(0, fx.startTime || 0);
                   const end = fx.endTime > start ? fx.endTime : duration;
@@ -3135,17 +3302,17 @@ export function TimelineEditor({
 
             {/* Right-side padding inside scrollable timeline so final clip endpoints remain completely visible */}
             <div className="w-4 sm:w-5 shrink-0 flex flex-col">
-              <div className="sticky top-0 z-20 h-7 shrink-0 bg-[#14141B] border-b border-white/[0.08]" />
+              <div className="sticky top-0 z-20 h-8 lg:h-7 shrink-0 bg-[#14141B] border-b border-white/[0.08]" />
             </div>
           </div>
         </div>
 
-        {/* RIGHT: DEDICATED ADD TRACK BUTTON COLUMN */}
+        {/* RIGHT: DEDICATED ADD TRACK BUTTON COLUMN (Desktop only >= lg) */}
         <div
           ref={rightColRef}
           onScroll={(e) => syncVerticalFromSide(e.currentTarget)}
           style={centerHScrollbarPx > 0 ? { paddingBottom: `${centerHScrollbarPx}px` } : undefined}
-          className="w-11 sm:w-12 shrink-0 bg-[#121218] border-l border-white/[0.09] overflow-y-auto overflow-x-hidden no-scrollbar flex flex-col"
+          className="hidden lg:flex w-12 shrink-0 bg-[#121218] border-l border-white/[0.09] overflow-y-auto overflow-x-hidden no-scrollbar flex-col"
         >
           {/* Sticky Header aligned with Time Ruler (h-7) */}
           <div className="sticky top-0 z-40 h-7 shrink-0 bg-[#14141B] border-b border-white/[0.08] flex items-center justify-center">
@@ -3179,6 +3346,23 @@ export function TimelineEditor({
             ))}
           </div>
         </div>
+      </div>
+    </div>
+  );
+}
+
+function MobileTrackMicroBadge({
+  label,
+  dotClass,
+}: {
+  label: string;
+  dotClass: string;
+}) {
+  return (
+    <div className="lg:hidden sticky left-1.5 top-0 h-0 w-0 overflow-visible z-20 pointer-events-none">
+      <div className="mt-1 inline-flex items-center gap-1 px-1.5 py-0.5 rounded bg-[#09090B]/85 backdrop-blur-xs border border-white/10 text-[9px] font-medium text-zinc-200 whitespace-nowrap shadow">
+        <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${dotClass}`} />
+        <span>{label}</span>
       </div>
     </div>
   );

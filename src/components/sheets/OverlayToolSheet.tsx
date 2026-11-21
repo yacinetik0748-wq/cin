@@ -231,7 +231,7 @@ export function OverlayToolSheet({
       {selectedLogo && (
         <div className="space-y-3">
           <div className="p-3 rounded-xl bg-[#18181D] border border-white/[0.08] space-y-3">
-            <div className="grid grid-cols-5 gap-1.5">
+            <div className="grid grid-cols-3 min-[360px]:grid-cols-5 gap-1.5">
               {(
                 [
                   ['top-left', 'Top L'],
