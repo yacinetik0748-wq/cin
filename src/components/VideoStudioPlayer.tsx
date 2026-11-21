@@ -9,6 +9,7 @@ import {
   Crop,
   Grid,
   Loader2,
+  Lock,
   Maximize2,
   Minimize2,
   Pause,
@@ -69,6 +70,7 @@ import {
   videoBoxToStageBox,
 } from '../lib/blurMasks';
 import { buildOrderedLayerTokens } from './LayerPanel';
+import { LOCKED_LAYER_MESSAGE } from '../lib/layerLock';
 
 interface VideoStudioPlayerProps {
   project: Project;
@@ -98,11 +100,12 @@ interface VideoStudioPlayerProps {
   onOpenSpeedEditor?: () => void;
   mobileCollapsed?: boolean;
   onToggleMobileCollapsed?: () => void;
+  onNotify?: (msg: string) => void;
 }
 
 type ResizeHandleDir = 'n' | 'ne' | 'e' | 'se' | 's' | 'sw' | 'w' | 'nw';
 
-type ActiveInteraction =
+type ActiveInteraction = (
   | {
       kind: 'blur';
       id: string;
@@ -196,7 +199,8 @@ type ActiveInteraction =
       origTop: number; // % 0..100
       origRight: number; // % 0..100
       origBottom: number; // % 0..100
-    };
+    }
+) & { locked?: boolean };
 
 const SNAP_TARGETS = [10, 50, 90];
 const SNAP_THRESHOLD_PCT = 1.6;
@@ -347,6 +351,7 @@ export function VideoStudioPlayer({
   onOpenSpeedEditor,
   mobileCollapsed = false,
   onToggleMobileCollapsed,
+  onNotify,
 }: VideoStudioPlayerProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const stageViewportRef = useRef<HTMLDivElement>(null);
@@ -358,6 +363,7 @@ export function VideoStudioPlayer({
   const musicAudioRef = useRef<HTMLAudioElement>(null);
   const sfxAudioRef = useRef<HTMLAudioElement>(null);
   const playClockRef = useRef<{ startedAtPerf: number; startedAtTimeline: number } | null>(null);
+  const lockedNotifySentRef = useRef(false);
 
   const [isPlaying, setIsPlaying] = useState(false);
   const [isFullscreen, setIsFullscreen] = useState(false);
@@ -368,9 +374,14 @@ export function VideoStudioPlayer({
   const isCropEditActive =
     !readOnlyPreview &&
     Boolean(onUpdateCanvas) &&
+    !project.canvas?.videoLocked &&
     (cropEditMode !== undefined ? cropEditMode : localCropEditMode);
 
   const setCropEditActive = (next: boolean) => {
+    if (next && project.canvas?.videoLocked) {
+      onNotify?.(LOCKED_LAYER_MESSAGE);
+      return;
+    }
     if (onToggleCropEditMode) onToggleCropEditMode(next);
     setLocalCropEditMode(next);
   };
@@ -1951,6 +1962,19 @@ export function VideoStudioPlayer({
       }
 
       if (!interaction) return;
+      if (interaction.locked) {
+        if (
+          Math.abs(clientX - interaction.startClientX) > 4 ||
+          Math.abs(clientY - interaction.startClientY) > 4
+        ) {
+          if (interaction.kind === 'video') interaction.moved = true;
+          if (!lockedNotifySentRef.current) {
+            lockedNotifySentRef.current = true;
+            onNotify?.(LOCKED_LAYER_MESSAGE);
+          }
+        }
+        return;
+      }
       const dx = (clientX - interaction.startClientX) / Math.max(1, rect.width);
       const dy = (clientY - interaction.startClientY) / Math.max(1, rect.height);
 
@@ -2272,6 +2296,7 @@ export function VideoStudioPlayer({
       onUpdateCanvas,
       onUpdateLogo,
       onUpdateSubtitleStyle,
+      onNotify,
       project.blurs,
       project.subtitleStyle.extraElements,
       canvas.cropMode,
@@ -3346,10 +3371,11 @@ export function VideoStudioPlayer({
               canvas.bgImageVisible !== false && (
                 <div
                   onPointerDown={(e) => {
-                    if (readOnlyPreview || drawMode !== 'none' || isCropEditActive || !onUpdateCanvas) return;
+                    if (readOnlyPreview || drawMode !== 'none' || isCropEditActive) return;
                     e.stopPropagation();
                     onSelectElement?.({ kind: 'bg-image' });
-                    if (canvas.bgImageLocked) return;
+                    if (!onUpdateCanvas) return;
+                    lockedNotifySentRef.current = false;
                     setInteraction({
                       kind: 'bg-image',
                       action: 'move',
@@ -3359,6 +3385,7 @@ export function VideoStudioPlayer({
                       origOffsetY: canvas.bgImageOffsetY || 0,
                       origScale: canvas.bgImageScale || 1,
                       origRot: canvas.bgImageRotation || 0,
+                      locked: Boolean(canvas.bgImageLocked),
                     });
                   }}
                   style={{
@@ -3372,9 +3399,17 @@ export function VideoStudioPlayer({
                   }}
                   className={`absolute left-1/2 top-1/2 w-full h-full select-none ${
                     editingGuidesOn && isSelectedEl({ kind: 'bg-image' })
-                      ? 'ring-2 ring-cyan-400'
+                      ? canvas.bgImageLocked
+                        ? 'ring-2 ring-amber-400'
+                        : 'ring-2 ring-cyan-400'
                       : ''
-                  } ${onUpdateCanvas && !canvas.bgImageLocked ? 'cursor-move' : ''}`}
+                  } ${
+                    onUpdateCanvas
+                      ? canvas.bgImageLocked
+                        ? 'cursor-pointer'
+                        : 'cursor-move'
+                      : ''
+                  }`}
                 >
                   <img
                     src={resolvedUrls.bgImage || canvas.bgImageUrl}
@@ -3419,10 +3454,14 @@ export function VideoStudioPlayer({
                     if (readOnlyPreview || drawMode !== 'none' || isCropEditActive) return;
                     e.stopPropagation();
                     onSelectElement?.({ kind: 'video', clipId: activeVideoMatch?.clip.id });
-                    if (!onUpdateCanvas || canvas.videoLocked) {
+                    const videoIsLocked = Boolean(
+                      canvas.videoLocked || activeVideoMatch?.clip.locked
+                    );
+                    if (!onUpdateCanvas) {
                       void togglePlay();
                       return;
                     }
+                    lockedNotifySentRef.current = false;
                     setInteraction({
                       kind: 'video',
                       action: 'move',
@@ -3433,13 +3472,22 @@ export function VideoStudioPlayer({
                       origZoom: canvas.zoom || 1,
                       origRot: canvas.videoRotation || 0,
                       moved: false,
+                      locked: videoIsLocked,
                     });
                   }}
                   className={`touch-none ${
-                    editingGuidesOn && isSelectedEl({ kind: 'video' }) && !canvas.videoLocked
-                      ? 'ring-2 ring-violet-400'
+                    editingGuidesOn && isSelectedEl({ kind: 'video' })
+                      ? canvas.videoLocked || activeVideoMatch?.clip.locked
+                        ? 'ring-2 ring-amber-400'
+                        : 'ring-2 ring-violet-400'
                       : ''
-                  } ${onUpdateCanvas && !canvas.videoLocked && drawMode === 'none' ? 'cursor-move' : ''}`}
+                  } ${
+                    onUpdateCanvas && drawMode === 'none'
+                      ? canvas.videoLocked || activeVideoMatch?.clip.locked
+                        ? 'cursor-pointer'
+                        : 'cursor-move'
+                      : ''
+                  }`}
                 >
                   <div className="w-full h-full overflow-hidden relative">
                     <video
@@ -3475,6 +3523,7 @@ export function VideoStudioPlayer({
                   {editingGuidesOn &&
                     isSelectedEl({ kind: 'video' }) &&
                     !canvas.videoLocked &&
+                    !activeVideoMatch?.clip.locked &&
                     onUpdateCanvas &&
                     !isCropEditActive &&
                     renderTransformHandles(
@@ -4006,9 +4055,11 @@ export function VideoStudioPlayer({
                 ? videoBoxToStageBox(rawBox, videoFrameGeom)
                 : { x: rawBox.x, y: rawBox.y, width: rawBox.width, height: rawBox.height, extraRotation: 0 };
               const isSelected = isSelectedEl({ kind: 'blur', id: blur.id });
-              const canEditBox =
-                !readOnlyPreview && Boolean(onUpdateBlur) && drawMode === 'none' && !blur.locked;
+              const isBlurLocked = Boolean(blur.locked);
+              const canSelectBox = !readOnlyPreview && drawMode === 'none' && !isCropEditActive;
+              const canEditBox = canSelectBox && Boolean(onUpdateBlur) && !isBlurLocked;
               const showOutline = isSelected && editingGuidesOn && canEditBox;
+              const showLockedOutline = isSelected && editingGuidesOn && isBlurLocked;
               const featherAmt = Math.max(0, Math.min(30, blur.feather ?? 10));
               const innerRadiusPct = Math.max(45, 98 - featherAmt * 1.4);
               const featherEdgePct = Math.min(32, featherAmt * 0.9);
@@ -4044,7 +4095,8 @@ export function VideoStudioPlayer({
                     if (readOnlyPreview || drawMode !== 'none' || isCropEditActive) return;
                     e.stopPropagation();
                     onSelectElement?.({ kind: 'blur', id: blur.id });
-                    if (!canEditBox) return;
+                    if (!onUpdateBlur) return;
+                    lockedNotifySentRef.current = false;
                     setInteraction({
                       kind: 'blur',
                       id: blur.id,
@@ -4056,12 +4108,19 @@ export function VideoStudioPlayer({
                       origW: rawBox.width,
                       origH: rawBox.height,
                       origRot: blur.rotation || 0,
+                      locked: isBlurLocked,
                     });
                   }}
                   className={`absolute transition-none touch-none ${
-                    canEditBox ? 'cursor-move' : 'pointer-events-none'
+                    canEditBox
+                      ? 'cursor-move'
+                      : canSelectBox
+                      ? 'cursor-pointer'
+                      : 'pointer-events-none'
                   } ${
-                    showOutline
+                    showLockedOutline
+                      ? 'ring-2 ring-amber-400'
+                      : showOutline
                       ? blur.isSubtitleMask
                         ? 'ring-2 ring-sky-400'
                         : 'ring-2 ring-violet-400'
@@ -4078,6 +4137,11 @@ export function VideoStudioPlayer({
                     transformOrigin: 'center center',
                   }}
                 >
+                  {showLockedOutline && (
+                    <span className="absolute -top-2.5 -left-1 z-30 inline-flex items-center justify-center w-4 h-4 rounded-full bg-amber-400 text-zinc-950 shadow pointer-events-none">
+                      <Lock className="w-2.5 h-2.5" />
+                    </span>
+                  )}
                   <div
                     className="w-full h-full pointer-events-none"
                     style={{
@@ -4154,9 +4218,11 @@ export function VideoStudioPlayer({
             {activeLogos.map((logo) => {
               const selected = isSelectedEl({ kind: 'logo', id: logo.id });
               const animPos = getAnimatedLogoPosition(logo);
-              const canEditLogo =
-                !readOnlyPreview && Boolean(onUpdateLogo) && drawMode === 'none' && !logo.locked;
+              const isLogoLocked = Boolean(logo.locked);
+              const canSelectLogo = !readOnlyPreview && drawMode === 'none' && !isCropEditActive;
+              const canEditLogo = canSelectLogo && Boolean(onUpdateLogo) && !isLogoLocked;
               const showOutline = selected && editingGuidesOn && canEditLogo;
+              const showLockedOutline = selected && editingGuidesOn && isLogoLocked;
 
               return (
                 <div
@@ -4165,7 +4231,8 @@ export function VideoStudioPlayer({
                     if (readOnlyPreview || drawMode !== 'none' || isCropEditActive) return;
                     e.stopPropagation();
                     onSelectElement?.({ kind: 'logo', id: logo.id });
-                    if (!canEditLogo) return;
+                    if (!onUpdateLogo) return;
+                    lockedNotifySentRef.current = false;
                     setInteraction({
                       kind: 'logo',
                       id: logo.id,
@@ -4176,10 +4243,21 @@ export function VideoStudioPlayer({
                       origY: logo.y,
                       origW: logo.widthPct,
                       origRot: logo.rotation || 0,
+                      locked: isLogoLocked,
                     });
                   }}
-                  className={`absolute touch-none ${canEditLogo ? 'cursor-move' : 'pointer-events-none'} ${
-                    showOutline ? 'ring-2 ring-violet-400 rounded-sm' : ''
+                  className={`absolute touch-none ${
+                    canEditLogo
+                      ? 'cursor-move'
+                      : canSelectLogo
+                      ? 'cursor-pointer'
+                      : 'pointer-events-none'
+                  } ${
+                    showLockedOutline
+                      ? 'ring-2 ring-amber-400 rounded-sm'
+                      : showOutline
+                      ? 'ring-2 ring-violet-400 rounded-sm'
+                      : ''
                   }`}
                   style={{
                     zIndex: layerZIndexMap.get(`logo:${logo.id}`) ?? 22,
@@ -4191,6 +4269,11 @@ export function VideoStudioPlayer({
                     transformOrigin: 'center center',
                   }}
                 >
+                  {showLockedOutline && (
+                    <span className="absolute -top-2.5 -left-1 z-30 inline-flex items-center justify-center w-4 h-4 rounded-full bg-amber-400 text-zinc-950 shadow pointer-events-none">
+                      <Lock className="w-2.5 h-2.5" />
+                    </span>
+                  )}
                   <img
                     src={resolvedUrls.logos[logo.id] || logo.url}
                     alt={logo.filename}
@@ -4241,6 +4324,8 @@ export function VideoStudioPlayer({
                   ...project.subtitleStyle,
                   ...(activeCaption.styleOverride || {}),
                 };
+                const rawCap = project.captions.find((c) => c.id === activeCaption.id);
+                const isCaptionLocked = Boolean(effStyle.locked || rawCap?.locked);
                 const effX = effStyle.posX !== undefined ? effStyle.posX : 50;
                 const effY =
                   effStyle.posY !== undefined
@@ -4256,7 +4341,8 @@ export function VideoStudioPlayer({
                       if (readOnlyPreview || drawMode !== 'none' || isCropEditActive) return;
                       e.stopPropagation();
                       onSelectElement?.({ kind: 'captions', segmentId: activeCaption.id });
-                      if (!onUpdateSubtitleStyle || effStyle.locked) return;
+                      if (!onUpdateSubtitleStyle) return;
+                      lockedNotifySentRef.current = false;
                       setInteraction({
                         kind: 'captions',
                         action: 'move',
@@ -4266,6 +4352,7 @@ export function VideoStudioPlayer({
                         origY: effY,
                         origScale: effStyle.scale ?? 1,
                         origRot: effStyle.rotation ?? 0,
+                        locked: isCaptionLocked,
                       });
                     }}
                     style={{
@@ -4280,23 +4367,31 @@ export function VideoStudioPlayer({
                       transformOrigin: 'center center',
                     }}
                     className={`absolute select-none touch-none ${
-                      !readOnlyPreview && onUpdateSubtitleStyle && !effStyle.locked
-                        ? 'cursor-move'
+                      !readOnlyPreview && drawMode === 'none' && !isCropEditActive
+                        ? !isCaptionLocked && onUpdateSubtitleStyle
+                          ? 'cursor-move'
+                          : 'cursor-pointer'
                         : 'pointer-events-none'
                     } ${
-                      editingGuidesOn &&
-                      isSelectedEl({ kind: 'captions' }) &&
-                      !effStyle.locked &&
-                      onUpdateSubtitleStyle
-                        ? 'ring-2 ring-violet-400 rounded-lg p-0.5'
+                      editingGuidesOn && isSelectedEl({ kind: 'captions' })
+                        ? isCaptionLocked
+                          ? 'ring-2 ring-amber-400 rounded-lg p-0.5'
+                          : onUpdateSubtitleStyle
+                          ? 'ring-2 ring-violet-400 rounded-lg p-0.5'
+                          : ''
                         : ''
                     }`}
                   >
+                    {editingGuidesOn && isSelectedEl({ kind: 'captions' }) && isCaptionLocked && (
+                      <span className="absolute -top-2.5 -left-1 z-30 inline-flex items-center justify-center w-4 h-4 rounded-full bg-amber-400 text-zinc-950 shadow pointer-events-none">
+                        <Lock className="w-2.5 h-2.5" />
+                      </span>
+                    )}
                     <div style={buildScaledBoxStyle(effStyle)}>{renderCaptionInner()}</div>
 
                     {editingGuidesOn &&
                       isSelectedEl({ kind: 'captions' }) &&
-                      !effStyle.locked &&
+                      !isCaptionLocked &&
                       onUpdateSubtitleStyle &&
                       renderTransformHandles(
                         (dir, ev) => {
@@ -4360,7 +4455,8 @@ export function VideoStudioPlayer({
                     if (readOnlyPreview || drawMode !== 'none' || isCropEditActive) return;
                     e.stopPropagation();
                     onSelectElement?.({ kind: 'caption-element', id: el.id });
-                    if (!onUpdateSubtitleStyle || el.locked) return;
+                    if (!onUpdateSubtitleStyle) return;
+                    lockedNotifySentRef.current = false;
                     setInteraction({
                       kind: 'caption-element',
                       id: el.id,
@@ -4371,6 +4467,7 @@ export function VideoStudioPlayer({
                       origY: curY,
                       origScale: mergedStyle.scale ?? 1,
                       origRot: mergedStyle.rotation ?? 0,
+                      locked: Boolean(el.locked),
                     });
                   }}
                   style={{
@@ -4385,15 +4482,26 @@ export function VideoStudioPlayer({
                     transformOrigin: 'center center',
                   }}
                   className={`absolute select-none touch-none ${
-                    !readOnlyPreview && onUpdateSubtitleStyle && !el.locked
-                      ? 'cursor-move'
+                    !readOnlyPreview && drawMode === 'none' && !isCropEditActive
+                      ? !el.locked && onUpdateSubtitleStyle
+                        ? 'cursor-move'
+                        : 'cursor-pointer'
                       : 'pointer-events-none'
                   } ${
-                    editingGuidesOn && isSel && !el.locked && onUpdateSubtitleStyle
-                      ? 'ring-2 ring-cyan-400 rounded-lg p-0.5'
+                    editingGuidesOn && isSel
+                      ? el.locked
+                        ? 'ring-2 ring-amber-400 rounded-lg p-0.5'
+                        : onUpdateSubtitleStyle
+                        ? 'ring-2 ring-cyan-400 rounded-lg p-0.5'
+                        : ''
                       : ''
                   }`}
                 >
+                  {editingGuidesOn && isSel && el.locked && (
+                    <span className="absolute -top-2.5 -left-1 z-30 inline-flex items-center justify-center w-4 h-4 rounded-full bg-amber-400 text-zinc-950 shadow pointer-events-none">
+                      <Lock className="w-2.5 h-2.5" />
+                    </span>
+                  )}
                   <div style={buildScaledBoxStyle(mergedStyle)}>
                     <span>{applyTextTransform(rawDisplayText, mergedStyle)}</span>
                   </div>

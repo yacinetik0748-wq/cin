@@ -20,6 +20,7 @@ import {
 } from '../../types/studio';
 import { api } from '../../lib/api';
 import { createWorkflowUpdate } from '../../lib/workflowStages';
+import { LOCKED_LAYER_MESSAGE } from '../../lib/layerLock';
 import { CollapsibleSection } from '../ui/CollapsibleSection';
 import { StudioToolMemory } from './toolMemory';
 
@@ -29,6 +30,7 @@ interface OverlayToolSheetProps {
   onPatchProject: ProjectPatchFn;
   selectedLogoId: string | null;
   onSelectLogo: (id: string | null) => void;
+  onShowNotice?: (msg: string) => void;
   memory: StudioToolMemory;
   onUpdateMemory: (patch: Partial<StudioToolMemory>) => void;
 }
@@ -47,6 +49,7 @@ export function OverlayToolSheet({
   onPatchProject,
   selectedLogoId,
   onSelectLogo,
+  onShowNotice,
   memory,
   onUpdateMemory,
 }: OverlayToolSheetProps) {
@@ -58,6 +61,11 @@ export function OverlayToolSheet({
   const selectedLogo =
     project.logos.find((l) => l.id === selectedLogoId) || project.logos[0] || null;
   const motion = selectedLogo?.motion || DEFAULT_MOTION;
+
+  const notifyLocked = () => {
+    setErrorMsg(LOCKED_LAYER_MESSAGE);
+    onShowNotice?.(LOCKED_LAYER_MESSAGE);
+  };
 
   const handleUploadLogo = async (file: File) => {
     setErrorMsg(null);
@@ -75,6 +83,17 @@ export function OverlayToolSheet({
   };
 
   const updateLogo = (id: string, patch: Partial<LogoOverlay>, opts?: ProjectPatchOptions) => {
+    const patchKeys = Object.keys(patch);
+    const isLockOrVisOnly =
+      patchKeys.length > 0 && patchKeys.every((k) => k === 'locked' || k === 'enabled');
+    if (!isLockOrVisOnly) {
+      const target = project.logos.find((l) => l.id === id);
+      if (target?.locked) {
+        notifyLocked();
+        return;
+      }
+    }
+    if (errorMsg === LOCKED_LAYER_MESSAGE) setErrorMsg(null);
     onPatchProject(
       project.id,
       (cur) => ({
@@ -98,6 +117,10 @@ export function OverlayToolSheet({
   };
 
   const applyPreset = (logo: LogoOverlay, preset: LogoOverlay['presetPosition']) => {
+    if (logo.locked) {
+      notifyLocked();
+      return;
+    }
     const wNorm = logo.widthPct / 100;
     const coords: Record<LogoOverlay['presetPosition'], { x: number; y: number }> = {
       'top-left': { x: 0.04, y: 0.05 },
@@ -115,6 +138,11 @@ export function OverlayToolSheet({
   };
 
   const removeLogo = (id: string) => {
+    const target = project.logos.find((l) => l.id === id);
+    if (target?.locked) {
+      notifyLocked();
+      return;
+    }
     const remaining = project.logos.filter((l) => l.id !== id);
     onPatchProject(
       project.id,
@@ -230,6 +258,21 @@ export function OverlayToolSheet({
 
       {selectedLogo && (
         <div className="space-y-3">
+          {selectedLogo.locked && (
+            <div className="px-3 py-2 rounded-xl bg-amber-500/12 border border-amber-500/35 text-xs text-amber-200 flex items-center justify-between gap-2">
+              <span className="flex items-center gap-1.5 min-w-0">
+                <Lock className="w-3.5 h-3.5 text-amber-400 shrink-0" />
+                <span className="truncate">Layer locked — editing blocked</span>
+              </span>
+              <button
+                type="button"
+                onClick={() => updateLogo(selectedLogo.id, { locked: false })}
+                className="min-h-[28px] px-2.5 py-0.5 rounded-lg bg-amber-500/20 hover:bg-amber-500/30 border border-amber-400/40 text-[11px] font-semibold text-amber-100 shrink-0 cursor-pointer"
+              >
+                Unlock
+              </button>
+            </div>
+          )}
           <div className="p-3 rounded-xl bg-[#18181D] border border-white/[0.08] space-y-3">
             <div className="grid grid-cols-3 min-[360px]:grid-cols-5 gap-1.5">
               {(

@@ -20,6 +20,7 @@ import {
   SubtitleStyle,
 } from '../../types/studio';
 import { BUILTIN_FONT_CATALOG, ensureFontLoaded } from '../../lib/fontCatalog';
+import { LOCKED_LAYER_MESSAGE } from '../../lib/layerLock';
 import { CollapsibleSection } from '../ui/CollapsibleSection';
 import { StudioToolMemory } from './toolMemory';
 
@@ -32,6 +33,7 @@ interface TextToolSheetProps {
   selectedElement: StudioElementSelection;
   onSelectElement: (el: StudioElementSelection) => void;
   onOpenCaptionsTool: () => void;
+  onShowNotice?: (msg: string) => void;
   memory: StudioToolMemory;
   onUpdateMemory: (patch: Partial<StudioToolMemory>) => void;
 }
@@ -42,6 +44,7 @@ export function TextToolSheet({
   selectedElement,
   onSelectElement,
   onOpenCaptionsTool,
+  onShowNotice,
   memory,
   onUpdateMemory,
 }: TextToolSheetProps) {
@@ -93,6 +96,12 @@ export function TextToolSheet({
     opts?: { undoGroupKey?: string; immediate?: boolean }
   ) => {
     if (!activeExtraEl) return;
+    const keys = Object.keys(patch);
+    const isVisOrLockOnly = keys.length > 0 && keys.every((k) => k === 'visible' || k === 'locked');
+    if (activeExtraEl.locked && !isVisOrLockOnly) {
+      onShowNotice?.(LOCKED_LAYER_MESSAGE);
+      return;
+    }
     onUpdateSubtitleStyle(
       {
         extraElements: extraElements.map((item) =>
@@ -108,10 +117,18 @@ export function TextToolSheet({
     opts?: { undoGroupKey?: string; immediate?: boolean }
   ) => {
     if (!activeExtraEl) return;
+    if (activeExtraEl.locked) {
+      onShowNotice?.(LOCKED_LAYER_MESSAGE);
+      return;
+    }
     updateActiveEl({ style: { ...activeExtraEl.style, ...patch } }, opts);
   };
 
   const handleDuplicate = (el: CaptionElementLayer) => {
+    if (el.locked) {
+      onShowNotice?.(LOCKED_LAYER_MESSAGE);
+      return;
+    }
     const copy: CaptionElementLayer = {
       ...el,
       id: uuidv4(),
@@ -128,6 +145,11 @@ export function TextToolSheet({
   };
 
   const handleDelete = (id: string) => {
+    const target = extraElements.find((el) => el.id === id);
+    if (target?.locked) {
+      onShowNotice?.(LOCKED_LAYER_MESSAGE);
+      return;
+    }
     const next = extraElements.filter((el) => el.id !== id);
     onUpdateSubtitleStyle({ extraElements: next }, { immediate: true });
     onSelectElement(next[0] ? { kind: 'caption-element', id: next[0].id } : null);
@@ -138,6 +160,10 @@ export function TextToolSheet({
     if (idx === -1) return;
     const swapIdx = dir === 'up' ? idx + 1 : idx - 1;
     if (swapIdx < 0 || swapIdx >= extraElements.length) return;
+    if (extraElements[idx].locked || extraElements[swapIdx].locked) {
+      onShowNotice?.(LOCKED_LAYER_MESSAGE);
+      return;
+    }
     const next = [...extraElements];
     [next[idx], next[swapIdx]] = [next[swapIdx], next[idx]];
     onUpdateSubtitleStyle({ extraElements: next }, { immediate: true });
@@ -264,6 +290,21 @@ export function TextToolSheet({
       {/* Selected Text Element Essential Controls */}
       {activeExtraEl && activeStyle && (
         <div className="space-y-3">
+          {activeExtraEl.locked && (
+            <div className="px-3 py-2 rounded-xl bg-amber-500/12 border border-amber-500/35 text-xs text-amber-200 flex items-center justify-between gap-2">
+              <span className="flex items-center gap-1.5 min-w-0">
+                <Lock className="w-3.5 h-3.5 text-amber-400 shrink-0" />
+                <span className="truncate">Layer locked — editing blocked</span>
+              </span>
+              <button
+                type="button"
+                onClick={() => updateActiveEl({ locked: false }, { immediate: true })}
+                className="min-h-[28px] px-2.5 py-0.5 rounded-lg bg-amber-500/20 hover:bg-amber-500/30 border border-amber-400/40 text-[11px] font-semibold text-amber-100 shrink-0 cursor-pointer"
+              >
+                Unlock
+              </button>
+            </div>
+          )}
           <div className="p-3 rounded-xl bg-[#18181D] border border-white/[0.08] space-y-3">
             <div>
               <div className="flex items-center justify-between gap-2">

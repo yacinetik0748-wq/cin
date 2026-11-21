@@ -112,6 +112,7 @@ export interface CaptionSegment {
   words?: WordTiming[];
   wordsSource?: 'actual' | 'estimated';
   styleOverride?: Partial<SubtitleStyle>;
+  locked?: boolean;
 }
 
 export type SubtitleTemplate =
@@ -311,6 +312,7 @@ export interface VideoClip {
   audioUnlinked?: boolean;
   filterPreset?: ColorFilterPreset;
   filterIntensity?: number; // 0..100
+  locked?: boolean;
 }
 
 export interface OriginalAudioClip {
@@ -324,6 +326,7 @@ export interface OriginalAudioClip {
   volume?: number; // 0..2.0 clip gain multiplier
   muted?: boolean;
   linkedVideoClipId?: string;
+  locked?: boolean;
 }
 
 export interface TimelineAudioClip {
@@ -339,6 +342,7 @@ export interface TimelineAudioClip {
   volume?: number; // 0..2.0 clip gain multiplier
   muted?: boolean;
   loop?: boolean;
+  locked?: boolean;
 }
 
 export type StudioElementSelection =
@@ -713,6 +717,7 @@ export interface GeneratedVoiceClip {
   trimEndSec?: number;
   text: string;
   speaker?: string;
+  locked?: boolean;
 }
 
 export interface VoiceConfig {
@@ -730,22 +735,26 @@ export interface VoiceConfig {
   speakingSpeed: number; // 0.25..4.0
   voiceVolume: number; // 0..2.0
   voiceMuted?: boolean;
+  dubLocked?: boolean;
   timingOffsetSec: number; // -3.0..3.0
   preserveOriginalAudio: boolean;
   originalAudioEnabled?: boolean;
   originalAudioMuted?: boolean;
   originalAudioRemoved?: boolean;
+  origLocked?: boolean;
   originalAudioVolume: number; // 0..2.0
   fadeInSec: number;
   fadeOutSec: number;
   bgMusicEnabled?: boolean;
   bgMusicMuted?: boolean;
+  bgmLocked?: boolean;
   bgMusicFilename?: string;
   bgMusicUrl?: string;
   bgMusicVolume: number; // 0..2.0
   bgMusicClips?: TimelineAudioClip[];
   sfxEnabled?: boolean;
   sfxMuted?: boolean;
+  sfxLocked?: boolean;
   sfxFilename?: string;
   sfxUrl?: string;
   sfxVolume?: number; // 0..2.0
@@ -953,6 +962,7 @@ export interface VisualEffectItem {
 export interface VideoEffectsConfig {
   filterPreset: ColorFilterPreset;
   filterIntensity?: number; // 0..100 (default 100)
+  globalFilterLocked?: boolean;
   filterStack?: FilterLayerItem[]; // multiple stacked & timeline-bound color filter layers
   adjustments: ColorAdjustments;
   effects: VisualEffectItem[];

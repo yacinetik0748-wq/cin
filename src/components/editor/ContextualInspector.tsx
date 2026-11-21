@@ -62,6 +62,12 @@ import { BlurToolSheet } from '../sheets/BlurToolSheet';
 import { EffectsToolSheet } from '../sheets/EffectsToolSheet';
 import { LayersToolSheet } from '../sheets/LayersToolSheet';
 import { StudioToolMemory } from '../sheets/toolMemory';
+import { formatTimecode } from '../../lib/formatters';
+import {
+  getSelectedLayerTiming,
+  isClipOrLayerLocked,
+  LOCKED_LAYER_MESSAGE,
+} from '../../lib/layerLock';
 
 export interface ContextualActionButton {
   id: string;
@@ -215,6 +221,11 @@ export function ContextualInspector({
 }: ContextualInspectorProps) {
   const [moreOpen, setMoreOpen] = useState(false);
 
+  const selectedTiming = useMemo(
+    () => getSelectedLayerTiming(project, selectedElement ?? { kind: 'video' }, currentTime),
+    [project, selectedElement, currentTime]
+  );
+
   const selectionSummary = useMemo(() => {
     if (!selectedElement || selectedElement.kind === 'video') {
       const clips = getEffectiveVideoClips(project);
@@ -360,6 +371,11 @@ export function ContextualInspector({
           : null) ||
         findActiveVideoClipAtTime(clips, currentTime)?.clip ||
         clips[0];
+      const isLocked = isClipOrLayerLocked(
+        project,
+        selectedElement || { kind: 'video', clipId: activeClip?.id },
+        currentTime
+      );
       const list: ContextualActionButton[] = [
         {
           id: 'split',
@@ -380,6 +396,13 @@ export function ContextualInspector({
           Icon: FlipHorizontal2,
           active: Boolean(project.canvas?.flipH),
           onClick: () => onSubAction('flip'),
+        },
+        {
+          id: 'lock',
+          label: isLocked ? 'Unlock' : 'Lock',
+          Icon: isLocked ? Unlock : Lock,
+          active: isLocked,
+          onClick: () => onSubAction('lock'),
         },
       ];
       if (project.metadata?.hasAudio && !activeClip?.audioUnlinked) {
@@ -483,7 +506,7 @@ export function ContextualInspector({
     }
 
     if (selectedElement.kind === 'captions') {
-      const isLocked = Boolean(project.subtitleStyle.locked);
+      const isLocked = isClipOrLayerLocked(project, selectedElement, currentTime);
       const isVisible = Boolean(
         project.subtitleStyle.enabled && project.subtitleStyle.visible !== false
       );
@@ -599,6 +622,7 @@ export function ContextualInspector({
           ? Boolean(project.voice.fullDubUrl || project.voice.generatedClips.length > 0)
           : origUnlinked || Boolean(project.metadata?.hasAudio);
 
+      const isLocked = isClipOrLayerLocked(project, selectedElement, currentTime);
       const list: ContextualActionButton[] = [
         {
           id: 'mute',
@@ -606,6 +630,13 @@ export function ContextualInspector({
           Icon: isMuted ? VolumeX : Volume2,
           active: isMuted,
           onClick: () => onSubAction('mute'),
+        },
+        {
+          id: 'lock',
+          label: isLocked ? 'Unlock' : 'Lock',
+          Icon: isLocked ? Unlock : Lock,
+          active: isLocked,
+          onClick: () => onSubAction('lock'),
         },
       ];
       if (track === 'orig' && project.metadata?.hasAudio && !origUnlinked) {
@@ -639,7 +670,7 @@ export function ContextualInspector({
       const layer = selectedElement.filterId
         ? (fxConfig.filterStack || []).find((f) => f.id === selectedElement.filterId)
         : null;
-      const isLocked = Boolean(layer?.locked);
+      const isLocked = isClipOrLayerLocked(project, selectedElement, currentTime);
       const list: ContextualActionButton[] = [
         {
           id: 'fx-preview',
@@ -662,24 +693,26 @@ export function ContextualInspector({
             label: 'Duplicate',
             Icon: Copy,
             onClick: onDuplicateSelected,
-          },
+          }
+        );
+      }
+      if (layer || fxConfig.filterPreset !== 'none') {
+        list.push(
           {
             id: 'lock',
             label: isLocked ? 'Unlock' : 'Lock',
             Icon: isLocked ? Unlock : Lock,
             active: isLocked,
             onClick: () => onSubAction('lock'),
+          },
+          {
+            id: 'del-filter',
+            label: layer ? 'Delete' : 'Reset',
+            Icon: Trash2,
+            danger: true,
+            onClick: onDeleteSelected,
           }
         );
-      }
-      if (layer || fxConfig.filterPreset !== 'none') {
-        list.push({
-          id: 'del-filter',
-          label: layer ? 'Delete' : 'Reset',
-          Icon: Trash2,
-          danger: true,
-          onClick: onDeleteSelected,
-        });
       }
       return list;
     }
@@ -765,6 +798,7 @@ export function ContextualInspector({
           onDuplicateSelected={onDuplicateSelected}
           onDeleteSelected={onDeleteSelected}
           onSplitAtPlayhead={onSplitAtPlayhead}
+          onShowNotice={onShowNotice}
           memory={memory}
           onUpdateMemory={onUpdateMemory}
         />
@@ -778,6 +812,7 @@ export function ContextualInspector({
           onFlushSaves={onFlushSaves}
           currentTime={currentTime}
           onSeek={onSeek}
+          onShowNotice={onShowNotice}
           memory={memory}
           onUpdateMemory={onUpdateMemory}
         />
@@ -790,6 +825,7 @@ export function ContextualInspector({
           selectedElement={selectedElement}
           onSelectElement={onSelectElement}
           onOpenCaptionsTool={() => onSelectTool('captions', 'style')}
+          onShowNotice={onShowNotice}
           memory={memory}
           onUpdateMemory={onUpdateMemory}
         />
@@ -809,6 +845,7 @@ export function ContextualInspector({
           onSelectSegment={(segId) =>
             onSelectElement({ kind: 'captions', segmentId: segId || undefined })
           }
+          onShowNotice={onShowNotice}
           memory={memory}
           onUpdateMemory={onUpdateMemory}
         />
@@ -821,6 +858,7 @@ export function ContextualInspector({
           onPatchProject={onPatchProject}
           selectedLogoId={selectedLogoId}
           onSelectLogo={onSelectLogo}
+          onShowNotice={onShowNotice}
           memory={memory}
           onUpdateMemory={onUpdateMemory}
         />
@@ -837,6 +875,7 @@ export function ContextualInspector({
           onSetDrawMode={onSetDrawMode}
           selectedBlurId={selectedBlurId}
           onSelectBlur={onSelectBlur}
+          onShowNotice={onShowNotice}
           memory={memory}
           onUpdateMemory={onUpdateMemory}
         />
@@ -854,6 +893,7 @@ export function ContextualInspector({
           selectedElement={selectedElement}
           onSelectElement={onSelectElement}
           currentTime={currentTime}
+          onShowNotice={onShowNotice}
           memory={memory}
           onUpdateMemory={onUpdateMemory}
         />
@@ -862,10 +902,12 @@ export function ContextualInspector({
       {activeTool === 'layers' && (
         <LayersToolSheet
           project={project}
+          currentTime={currentTime}
           onPatchProject={onPatchProject}
           selectedElement={selectedElement}
           onSelectElement={onSelectElement}
           onOpenTool={onSelectTool}
+          onShowNotice={onShowNotice}
         />
       )}
     </>
@@ -874,6 +916,26 @@ export function ContextualInspector({
   if (variant === 'sheet') {
     return (
       <div className="space-y-3">
+        {selectedTiming && (
+          <div className="px-2.5 py-1.5 rounded-lg bg-[#181820] border border-white/[0.08] flex flex-wrap items-center justify-between gap-2 text-[10.5px] font-mono tabular-nums text-zinc-300">
+            <span className="text-zinc-200 font-sans font-medium truncate flex items-center gap-1.5">
+              {selectedTiming.locked && <Lock className="w-3 h-3 text-amber-300 shrink-0" />}
+              {selectionSummary.name}
+            </span>
+            <div className="flex flex-wrap items-center gap-x-2.5 gap-y-0.5">
+              <span>Start {formatTimecode(selectedTiming.start)}</span>
+              <span>End {formatTimecode(selectedTiming.end)}</span>
+              <span className="text-white font-semibold">
+                Dur {formatTimecode(selectedTiming.duration)}
+              </span>
+              {selectedTiming.fps && selectedTiming.durationFrames !== undefined && (
+                <span className="text-zinc-400">
+                  ({selectedTiming.durationFrames}f)
+                </span>
+              )}
+            </div>
+          </div>
+        )}
         {contextualActions.length > 0 && (
           <div className="flex items-center gap-1.5 overflow-x-auto pb-1 no-scrollbar">
             {contextualActions.map((act) => (
@@ -983,7 +1045,7 @@ export function ContextualInspector({
                       onClick={() => {
                         const cv = { ...DEFAULT_VIDEO_CANVAS, ...(project.canvas || {}) };
                         if (cv.videoLocked) {
-                          onShowNotice('Unlock the video layer to flip it.');
+                          onShowNotice(LOCKED_LAYER_MESSAGE);
                           return;
                         }
                         const next = !Boolean(cv.flipH);
@@ -1005,7 +1067,7 @@ export function ContextualInspector({
                       onClick={() => {
                         const cv = { ...DEFAULT_VIDEO_CANVAS, ...(project.canvas || {}) };
                         if (cv.videoLocked) {
-                          onShowNotice('Unlock the video layer to flip it.');
+                          onShowNotice(LOCKED_LAYER_MESSAGE);
                           return;
                         }
                         const next = !Boolean(cv.flipV);
@@ -1184,6 +1246,21 @@ export function ContextualInspector({
         </div>
 
         {/* Strict Contextual Quick Actions Row */}
+        {selectedTiming && (
+          <div className="pt-1 border-t border-white/[0.06] flex flex-wrap items-center gap-x-2.5 gap-y-0.5 text-[10px] font-mono tabular-nums text-zinc-400">
+            {selectedTiming.locked && <Lock className="w-2.5 h-2.5 text-amber-300 shrink-0" />}
+            <span>Start {formatTimecode(selectedTiming.start)}</span>
+            <span>End {formatTimecode(selectedTiming.end)}</span>
+            <span className="text-zinc-200 font-semibold">
+              Dur {formatTimecode(selectedTiming.duration)}
+            </span>
+            {selectedTiming.fps && selectedTiming.durationFrames !== undefined && (
+              <span>
+                ({selectedTiming.durationFrames}f @ {selectedTiming.fps}fps)
+              </span>
+            )}
+          </div>
+        )}
         {contextualActions.length > 0 && (
           <div className="mt-1.5 pt-1.5 border-t border-white/[0.06] flex items-center gap-1 overflow-x-auto no-scrollbar">
             {contextualActions.map((act) => (

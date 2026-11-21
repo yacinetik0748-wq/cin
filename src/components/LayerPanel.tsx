@@ -29,6 +29,7 @@ import {
   VideoEffectsConfig,
 } from '../types/studio';
 import { getEffectCatalogEntry, getFilterPresetMeta } from '../lib/videoFiltersCatalog';
+import { LOCKED_LAYER_MESSAGE } from '../lib/layerLock';
 
 interface LayerPanelProps {
   project: Project;
@@ -39,6 +40,7 @@ interface LayerPanelProps {
   onUpdateLogos: (nextLogos: LogoOverlay[]) => void;
   onUpdateSubtitleStyle: (patch: Partial<SubtitleStyle>) => void;
   onUpdateVideoEffects?: (patch: Partial<VideoEffectsConfig>) => void;
+  onShowNotice?: (msg: string) => void;
 }
 
 interface LayerRow {
@@ -97,6 +99,7 @@ export function LayerPanel({
   onUpdateLogos,
   onUpdateSubtitleStyle,
   onUpdateVideoEffects,
+  onShowNotice,
 }: LayerPanelProps) {
   const fxConfig = project.videoEffects || DEFAULT_VIDEO_EFFECTS;
   const filterStack = fxConfig.filterStack || [];
@@ -235,6 +238,11 @@ export function LayerPanel({
   const selectedRow = rowsTopToBottom.find(isRowSelected) || null;
 
   const moveOverlayOrder = (token: string, direction: 'forward' | 'backward') => {
+    const row = rowMap.get(token);
+    if (row?.locked) {
+      onShowNotice?.(LOCKED_LAYER_MESSAGE);
+      return;
+    }
     const overlayOnly = orderedBottomToTop.filter((t) => t !== 'bg-image' && t !== 'video');
     const idx = overlayOnly.indexOf(token);
     if (idx === -1) return;
@@ -291,6 +299,10 @@ export function LayerPanel({
   };
 
   const duplicateLayer = (row: LayerRow) => {
+    if (row.locked) {
+      onShowNotice?.(LOCKED_LAYER_MESSAGE);
+      return;
+    }
     if (row.kind === 'blur' && row.selection.kind === 'blur') {
       const targetId = row.selection.id;
       const orig = project.blurs.find((b) => b.id === targetId);
@@ -342,6 +354,10 @@ export function LayerPanel({
   };
 
   const deleteLayer = (row: LayerRow) => {
+    if (row.locked) {
+      onShowNotice?.(LOCKED_LAYER_MESSAGE);
+      return;
+    }
     if (row.kind === 'blur' && row.selection.kind === 'blur') {
       const targetId = row.selection.id;
       const next = project.blurs.filter((b) => b.id !== targetId);
@@ -362,6 +378,10 @@ export function LayerPanel({
 
   const updateSelectedOpacity = (opacity: number) => {
     if (!selectedRow) return;
+    if (selectedRow.locked) {
+      onShowNotice?.(LOCKED_LAYER_MESSAGE);
+      return;
+    }
     if (selectedRow.kind === 'video') {
       onUpdateCanvas({ videoOpacity: opacity });
     } else if (selectedRow.kind === 'bg-image') {
@@ -389,6 +409,10 @@ export function LayerPanel({
 
   const updateSelectedRotation = (rotation: number) => {
     if (!selectedRow) return;
+    if (selectedRow.locked) {
+      onShowNotice?.(LOCKED_LAYER_MESSAGE);
+      return;
+    }
     if (selectedRow.kind === 'video') {
       onUpdateCanvas({ videoRotation: rotation });
     } else if (selectedRow.kind === 'bg-image') {
@@ -473,16 +497,22 @@ export function LayerPanel({
                       <button
                         type="button"
                         onClick={() => moveOverlayOrder(row.token, 'forward')}
-                        title="Bring Forward"
-                        className="min-w-[36px] min-h-[36px] lg:min-w-[30px] lg:min-h-[30px] flex items-center justify-center text-zinc-400 hover:text-white rounded hover:bg-white/[0.06] cursor-pointer"
+                        title={row.locked ? LOCKED_LAYER_MESSAGE : 'Bring Forward'}
+                        aria-disabled={row.locked}
+                        className={`min-w-[36px] min-h-[36px] lg:min-w-[30px] lg:min-h-[30px] flex items-center justify-center rounded hover:bg-white/[0.06] cursor-pointer ${
+                          row.locked ? 'text-zinc-600 opacity-50' : 'text-zinc-400 hover:text-white'
+                        }`}
                       >
                         <ArrowUp className="w-3.5 h-3.5" />
                       </button>
                       <button
                         type="button"
                         onClick={() => moveOverlayOrder(row.token, 'backward')}
-                        title="Send Backward"
-                        className="min-w-[36px] min-h-[36px] lg:min-w-[30px] lg:min-h-[30px] flex items-center justify-center text-zinc-400 hover:text-white rounded hover:bg-white/[0.06] cursor-pointer"
+                        title={row.locked ? LOCKED_LAYER_MESSAGE : 'Send Backward'}
+                        aria-disabled={row.locked}
+                        className={`min-w-[36px] min-h-[36px] lg:min-w-[30px] lg:min-h-[30px] flex items-center justify-center rounded hover:bg-white/[0.06] cursor-pointer ${
+                          row.locked ? 'text-zinc-600 opacity-50' : 'text-zinc-400 hover:text-white'
+                        }`}
                       >
                         <ArrowDown className="w-3.5 h-3.5" />
                       </button>
@@ -548,15 +578,41 @@ export function LayerPanel({
             <button
               type="button"
               onClick={() => {
+                if (selectedRow.locked) {
+                  onShowNotice?.(LOCKED_LAYER_MESSAGE);
+                  return;
+                }
                 updateSelectedRotation(0);
                 updateSelectedOpacity(1);
               }}
-              className="text-[11px] text-zinc-400 hover:text-zinc-200 flex items-center gap-1 cursor-pointer shrink-0"
+              aria-disabled={selectedRow.locked}
+              title={selectedRow.locked ? LOCKED_LAYER_MESSAGE : 'Reset Transform'}
+              className={`text-[11px] flex items-center gap-1 cursor-pointer shrink-0 ${
+                selectedRow.locked
+                  ? 'text-amber-400/75 opacity-60'
+                  : 'text-zinc-400 hover:text-zinc-200'
+              }`}
             >
               <RotateCcw className="w-3 h-3" />
               Reset Transform
             </button>
           </div>
+
+          {selectedRow.locked && (
+            <div className="px-2.5 py-1.5 rounded-lg bg-amber-500/10 border border-amber-400/30 flex items-center justify-between gap-2 text-[11px] text-amber-200">
+              <span className="flex items-center gap-1.5">
+                <Lock className="w-3 h-3 text-amber-300 shrink-0" />
+                {LOCKED_LAYER_MESSAGE}
+              </span>
+              <button
+                type="button"
+                onClick={() => toggleLock(selectedRow)}
+                className="px-2 py-0.5 rounded bg-amber-400 text-zinc-950 font-semibold text-[10.5px] cursor-pointer shrink-0"
+              >
+                Unlock
+              </button>
+            </div>
+          )}
 
           {selectedRow.kind === 'blur' && selectedRow.selection.kind === 'blur' && (
             <div>
@@ -694,8 +750,12 @@ export function LayerPanel({
                     </button>
                     <button
                       type="button"
-                      disabled={Boolean(fl.locked)}
+                      aria-disabled={Boolean(fl.locked)}
                       onClick={() => {
+                        if (fl.locked) {
+                          onShowNotice?.(LOCKED_LAYER_MESSAGE);
+                          return;
+                        }
                         const copy = {
                           ...fl,
                           id: uuidv4(),
@@ -705,22 +765,30 @@ export function LayerPanel({
                         onUpdateVideoEffects({ filterStack: [...filterStack, copy] });
                         onSelectElement({ kind: 'filter', filterId: copy.id });
                       }}
-                      className="min-w-[34px] min-h-[34px] lg:min-w-[28px] lg:min-h-[28px] flex items-center justify-center text-zinc-400 hover:text-white disabled:opacity-35 rounded hover:bg-white/[0.06] cursor-pointer"
-                      title="Duplicate"
+                      className={`min-w-[34px] min-h-[34px] lg:min-w-[28px] lg:min-h-[28px] flex items-center justify-center rounded hover:bg-white/[0.06] cursor-pointer ${
+                        fl.locked ? 'text-zinc-600 opacity-35' : 'text-zinc-400 hover:text-white'
+                      }`}
+                      title={fl.locked ? LOCKED_LAYER_MESSAGE : 'Duplicate'}
                     >
                       <Copy className="w-3.5 h-3.5" />
                     </button>
                     <button
                       type="button"
-                      disabled={Boolean(fl.locked)}
+                      aria-disabled={Boolean(fl.locked)}
                       onClick={() => {
+                        if (fl.locked) {
+                          onShowNotice?.(LOCKED_LAYER_MESSAGE);
+                          return;
+                        }
                         onUpdateVideoEffects({
                           filterStack: filterStack.filter((x) => x.id !== fl.id),
                         });
                         if (isSel) onSelectElement(null);
                       }}
-                      className="min-w-[34px] min-h-[34px] lg:min-w-[28px] lg:min-h-[28px] flex items-center justify-center text-zinc-500 hover:text-red-400 disabled:opacity-35 rounded hover:bg-white/[0.06] cursor-pointer"
-                      title="Delete"
+                      className={`min-w-[34px] min-h-[34px] lg:min-w-[28px] lg:min-h-[28px] flex items-center justify-center rounded hover:bg-white/[0.06] cursor-pointer ${
+                        fl.locked ? 'text-zinc-600 opacity-35' : 'text-zinc-500 hover:text-red-400'
+                      }`}
+                      title={fl.locked ? LOCKED_LAYER_MESSAGE : 'Delete'}
                     >
                       <Trash2 className="w-3.5 h-3.5" />
                     </button>
@@ -793,8 +861,12 @@ export function LayerPanel({
                     </button>
                     <button
                       type="button"
-                      disabled={Boolean(fx.locked)}
+                      aria-disabled={Boolean(fx.locked)}
                       onClick={() => {
+                        if (fx.locked) {
+                          onShowNotice?.(LOCKED_LAYER_MESSAGE);
+                          return;
+                        }
                         const copy = {
                           ...fx,
                           id: uuidv4(),
@@ -804,22 +876,30 @@ export function LayerPanel({
                         onUpdateVideoEffects({ effects: [...effectsList, copy] });
                         onSelectElement({ kind: 'effect', effectId: copy.id });
                       }}
-                      className="min-w-[34px] min-h-[34px] lg:min-w-[28px] lg:min-h-[28px] flex items-center justify-center text-zinc-400 hover:text-white disabled:opacity-35 rounded hover:bg-white/[0.06] cursor-pointer"
-                      title="Duplicate"
+                      className={`min-w-[34px] min-h-[34px] lg:min-w-[28px] lg:min-h-[28px] flex items-center justify-center rounded hover:bg-white/[0.06] cursor-pointer ${
+                        fx.locked ? 'text-zinc-600 opacity-35' : 'text-zinc-400 hover:text-white'
+                      }`}
+                      title={fx.locked ? LOCKED_LAYER_MESSAGE : 'Duplicate'}
                     >
                       <Copy className="w-3.5 h-3.5" />
                     </button>
                     <button
                       type="button"
-                      disabled={Boolean(fx.locked)}
+                      aria-disabled={Boolean(fx.locked)}
                       onClick={() => {
+                        if (fx.locked) {
+                          onShowNotice?.(LOCKED_LAYER_MESSAGE);
+                          return;
+                        }
                         onUpdateVideoEffects({
                           effects: effectsList.filter((x) => x.id !== fx.id),
                         });
                         if (isSel) onSelectElement(null);
                       }}
-                      className="min-w-[34px] min-h-[34px] lg:min-w-[28px] lg:min-h-[28px] flex items-center justify-center text-zinc-500 hover:text-red-400 disabled:opacity-35 rounded hover:bg-white/[0.06] cursor-pointer"
-                      title="Delete"
+                      className={`min-w-[34px] min-h-[34px] lg:min-w-[28px] lg:min-h-[28px] flex items-center justify-center rounded hover:bg-white/[0.06] cursor-pointer ${
+                        fx.locked ? 'text-zinc-600 opacity-35' : 'text-zinc-500 hover:text-red-400'
+                      }`}
+                      title={fx.locked ? LOCKED_LAYER_MESSAGE : 'Delete'}
                     >
                       <Trash2 className="w-3.5 h-3.5" />
                     </button>

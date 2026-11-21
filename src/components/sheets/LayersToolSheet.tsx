@@ -6,10 +6,12 @@ import {
   EyeOff,
   Film,
   Layers,
+  Lock,
   Mic,
   Music,
   Sliders,
   Sparkles,
+  Unlock,
   Volume2,
   VolumeX,
   Wand2,
@@ -36,21 +38,32 @@ import {
   getProjectEffectiveDuration,
 } from '../../lib/videoTimeline';
 import { LayerPanel } from '../LayerPanel';
+import { formatTimecode } from '../../lib/formatters';
+import {
+  getSelectedLayerTiming,
+  isTrackLocked,
+  TimelineTrackId,
+  toggleTrackLockPatch,
+} from '../../lib/layerLock';
 
 interface LayersToolSheetProps {
   project: Project;
+  currentTime?: number;
   onPatchProject: ProjectPatchFn;
   selectedElement: StudioElementSelection;
   onSelectElement: (el: StudioElementSelection) => void;
   onOpenTool: (tool: StudioToolId, subTab?: string) => void;
+  onShowNotice?: (msg: string) => void;
 }
 
 export function LayersToolSheet({
   project,
+  currentTime = 0,
   onPatchProject,
   selectedElement,
   onSelectElement,
   onOpenTool,
+  onShowNotice,
 }: LayersToolSheetProps) {
   const handleOpenSelectedTool = () => {
     if (!selectedElement) return;
@@ -132,14 +145,17 @@ export function LayersToolSheet({
   const effectsList = fxConfig.effects || [];
   const effectsVisible = effectsList.some((e) => e.enabled);
 
+  const selectedTiming = getSelectedLayerTiming(project, selectedElement, currentTime);
+
   const trackRows: Array<{
-    id: string;
+    id: TimelineTrackId;
     label: string;
     meta: string;
     Icon: React.ComponentType<{ className?: string }>;
     accent: string;
     isAudio?: boolean;
     active: boolean;
+    locked: boolean;
     toggleOn: boolean;
     onSelect: () => void;
     onEdit: () => void;
@@ -152,6 +168,7 @@ export function LayersToolSheet({
       Icon: Film,
       accent: 'text-violet-400',
       active: selectedElement?.kind === 'video',
+      locked: isTrackLocked(project, 'video'),
       toggleOn: videoVisible,
       onSelect: () => onSelectElement({ kind: 'video', clipId: videoClips[0]?.id }),
       onEdit: () => {
@@ -178,6 +195,7 @@ export function LayersToolSheet({
       Icon: Captions,
       accent: 'text-amber-400',
       active: selectedElement?.kind === 'captions',
+      locked: isTrackLocked(project, 'captions'),
       toggleOn: captionsVisible,
       onSelect: () =>
         onSelectElement({ kind: 'captions', segmentId: project.captions[0]?.id }),
@@ -212,6 +230,7 @@ export function LayersToolSheet({
       active:
         selectedElement?.kind === 'audio' &&
         (!selectedElement.track || selectedElement.track === 'dub'),
+      locked: isTrackLocked(project, 'dub'),
       toggleOn: !dubMuted,
       onSelect: () => onSelectElement({ kind: 'audio', track: 'dub' }),
       onEdit: () => {
@@ -246,6 +265,7 @@ export function LayersToolSheet({
       accent: 'text-cyan-400',
       isAudio: true,
       active: selectedElement?.kind === 'audio' && selectedElement.track === 'orig',
+      locked: isTrackLocked(project, 'orig'),
       toggleOn: !origMuted,
       onSelect: () => onSelectElement({ kind: 'audio', track: 'orig' }),
       onEdit: () => {
@@ -278,6 +298,7 @@ export function LayersToolSheet({
       accent: 'text-indigo-400',
       isAudio: true,
       active: selectedElement?.kind === 'audio' && selectedElement.track === 'bgm',
+      locked: isTrackLocked(project, 'bgm'),
       toggleOn: !bgmMuted,
       onSelect: () => onSelectElement({ kind: 'audio', track: 'bgm' }),
       onEdit: () => {
@@ -312,6 +333,7 @@ export function LayersToolSheet({
       accent: 'text-emerald-400',
       isAudio: true,
       active: selectedElement?.kind === 'audio' && selectedElement.track === 'sfx',
+      locked: isTrackLocked(project, 'sfx'),
       toggleOn: !sfxMuted,
       onSelect: () => onSelectElement({ kind: 'audio', track: 'sfx' }),
       onEdit: () => {
@@ -345,6 +367,7 @@ export function LayersToolSheet({
       Icon: Layers,
       accent: 'text-purple-400',
       active: selectedElement?.kind === 'logo' || selectedElement?.kind === 'caption-element',
+      locked: isTrackLocked(project, 'overlays'),
       toggleOn: overlaysVisible,
       onSelect: () => {
         if (project.logos[0]) onSelectElement({ kind: 'logo', id: project.logos[0].id });
@@ -389,6 +412,7 @@ export function LayersToolSheet({
       Icon: Droplet,
       accent: 'text-sky-400',
       active: selectedElement?.kind === 'blur',
+      locked: isTrackLocked(project, 'blur'),
       toggleOn: blursVisible,
       onSelect: () => {
         if (project.blurs[0]) onSelectElement({ kind: 'blur', id: project.blurs[0].id });
@@ -419,6 +443,7 @@ export function LayersToolSheet({
       Icon: Wand2,
       accent: 'text-pink-400',
       active: selectedElement?.kind === 'filter',
+      locked: isTrackLocked(project, 'filters'),
       toggleOn: filtersVisible,
       onSelect: () => onSelectElement({ kind: 'filter', filterId: filterStack[0]?.id }),
       onEdit: () => onOpenTool('filters'),
@@ -450,6 +475,7 @@ export function LayersToolSheet({
       Icon: Sparkles,
       accent: 'text-fuchsia-400',
       active: selectedElement?.kind === 'effect',
+      locked: isTrackLocked(project, 'effects'),
       toggleOn: effectsVisible,
       onSelect: () => onSelectElement({ kind: 'effect', effectId: effectsList[0]?.id }),
       onEdit: () => onOpenTool('effects'),
@@ -479,18 +505,35 @@ export function LayersToolSheet({
   return (
     <div className="space-y-3">
       {selectedElement && (
-        <div className="px-3 py-2 rounded-xl bg-violet-600/15 border border-violet-500/40 flex items-center justify-between gap-2 text-xs">
-          <span className="text-violet-100 font-medium capitalize truncate">
-            Selected: {selectedLabel}
-          </span>
-          <button
-            type="button"
-            onClick={handleOpenSelectedTool}
-            className="min-h-[36px] px-2.5 py-1 rounded-lg bg-violet-600 hover:bg-violet-500 text-xs font-semibold text-white flex items-center gap-1 cursor-pointer shrink-0 whitespace-nowrap"
-          >
-            <Sliders className="w-3 h-3" />
-            Edit Properties
-          </button>
+        <div className="px-3 py-2 rounded-xl bg-violet-600/15 border border-violet-500/40 flex flex-col gap-1.5 text-xs">
+          <div className="flex items-center justify-between gap-2">
+            <span className="text-violet-100 font-medium capitalize truncate flex items-center gap-1.5">
+              {selectedTiming?.locked && <Lock className="w-3 h-3 text-amber-300 shrink-0" />}
+              Selected: {selectedLabel}
+            </span>
+            <button
+              type="button"
+              onClick={handleOpenSelectedTool}
+              className="min-h-[36px] px-2.5 py-1 rounded-lg bg-violet-600 hover:bg-violet-500 text-xs font-semibold text-white flex items-center gap-1 cursor-pointer shrink-0 whitespace-nowrap"
+            >
+              <Sliders className="w-3 h-3" />
+              Edit Properties
+            </button>
+          </div>
+          {selectedTiming && (
+            <div className="flex flex-wrap items-center gap-x-2.5 gap-y-0.5 text-[10.5px] font-mono tabular-nums text-zinc-300">
+              <span>Start {formatTimecode(selectedTiming.start)}</span>
+              <span>End {formatTimecode(selectedTiming.end)}</span>
+              <span className="text-white font-semibold">
+                Dur {formatTimecode(selectedTiming.duration)}
+              </span>
+              {selectedTiming.fps && selectedTiming.durationFrames !== undefined && (
+                <span className="text-zinc-400">
+                  ({selectedTiming.durationFrames}f @ {selectedTiming.fps}fps)
+                </span>
+              )}
+            </div>
+          )}
         </div>
       )}
 
@@ -509,9 +552,13 @@ export function LayersToolSheet({
             return (
               <div
                 key={tr.id}
-                className={`px-2 py-1.5 rounded-lg border flex items-center justify-between gap-1.5 text-xs transition-colors ${
+                className={`px-2 py-1.5 rounded-lg border flex items-center justify-between gap-1 text-xs transition-colors ${
                   tr.active
-                    ? 'bg-violet-600/18 border-violet-500/60 text-white'
+                    ? tr.locked
+                      ? 'bg-amber-950/30 border-amber-400/55 text-white'
+                      : 'bg-violet-600/18 border-violet-500/60 text-white'
+                    : tr.locked
+                    ? 'bg-amber-950/20 border-amber-500/35 text-zinc-200 hover:border-amber-400/55'
                     : 'bg-zinc-900/70 border-white/[0.06] text-zinc-200 hover:border-white/[0.14]'
                 }`}
               >
@@ -528,6 +575,34 @@ export function LayersToolSheet({
                 </button>
 
                 <div className="flex items-center gap-0.5 shrink-0">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      const res = toggleTrackLockPatch(project, tr.id);
+                      onPatchProject(
+                        project.id,
+                        () => ({
+                          ...res.patch,
+                          workflow: createWorkflowUpdate(project.workflow, {
+                            modifiedStage: 'editor',
+                            hasExistingExport: Boolean(project.lastExportUrl),
+                          }),
+                        }),
+                        { immediate: true }
+                      );
+                      onShowNotice?.(
+                        res.locked ? `Locked ${res.label}.` : `Unlocked ${res.label}.`
+                      );
+                    }}
+                    title={tr.locked ? `Unlock ${tr.label}` : `Lock ${tr.label}`}
+                    aria-label={tr.locked ? `Unlock ${tr.label}` : `Lock ${tr.label}`}
+                    aria-pressed={tr.locked}
+                    className={`min-w-[36px] min-h-[36px] flex items-center justify-center rounded-lg hover:bg-white/[0.06] cursor-pointer ${
+                      tr.locked ? 'text-amber-300 bg-amber-500/15' : 'text-zinc-400 hover:text-zinc-200'
+                    }`}
+                  >
+                    {tr.locked ? <Lock className="w-3.5 h-3.5" /> : <Unlock className="w-3.5 h-3.5" />}
+                  </button>
                   <button
                     type="button"
                     onClick={tr.onToggle}
@@ -574,6 +649,7 @@ export function LayersToolSheet({
         project={project}
         selectedElement={selectedElement}
         onSelectElement={onSelectElement}
+        onShowNotice={onShowNotice}
         onUpdateCanvas={(patch) => {
           onPatchProject(
             project.id,

@@ -70,6 +70,7 @@ export function getEffectiveVideoClips(project: Project): VideoClip[] {
           ...(c.filterIntensity !== undefined
             ? { filterIntensity: Math.max(0, Math.min(100, Number(c.filterIntensity))) }
             : {}),
+          ...(c.locked ? { locked: true } : {}),
         };
       })
       .sort((a, b) => a.timelineStart - b.timelineStart);
@@ -154,6 +155,7 @@ export function getEffectiveOriginalAudioClips(project: Project): OriginalAudioC
         volume: Math.max(0, Math.min(2.0, Number(c.volume ?? 1.0))),
         muted: Boolean(c.muted),
         linkedVideoClipId: c.linkedVideoClipId,
+        ...(c.locked ? { locked: true } : {}),
       };
     })
     .sort((a, b) => a.timelineStart - b.timelineStart);

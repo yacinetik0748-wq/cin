@@ -41,6 +41,7 @@ import {
   resolveBlurIntervals,
 } from '../../lib/blurMasks';
 import { generateForegroundMaskPng, trackObjectAcrossVideo } from '../../lib/visionEngine';
+import { LOCKED_LAYER_MESSAGE } from '../../lib/layerLock';
 import { CollapsibleSection } from '../ui/CollapsibleSection';
 import { StudioToolMemory } from './toolMemory';
 
@@ -54,6 +55,7 @@ interface BlurToolSheetProps {
   onSetDrawMode: (mode: 'none' | 'selective' | 'motion') => void;
   selectedBlurId: string | null;
   onSelectBlur: (id: string | null) => void;
+  onShowNotice?: (msg: string) => void;
   memory: StudioToolMemory;
   onUpdateMemory: (patch: Partial<StudioToolMemory>) => void;
 }
@@ -78,6 +80,7 @@ export function BlurToolSheet({
   onSetDrawMode,
   selectedBlurId,
   onSelectBlur,
+  onShowNotice,
   memory,
   onUpdateMemory,
 }: BlurToolSheetProps) {
@@ -86,6 +89,11 @@ export function BlurToolSheet({
   const [segmentBusy, setSegmentBusy] = useState(false);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [statusNotice, setStatusNotice] = useState<string | null>(null);
+
+  const notifyLocked = () => {
+    setErrorMsg(LOCKED_LAYER_MESSAGE);
+    onShowNotice?.(LOCKED_LAYER_MESSAGE);
+  };
 
   const duration = Math.max(1, project.metadata?.duration || 12);
   const selectedBlur = project.blurs.find((b) => b.id === selectedBlurId) || project.blurs[0] || null;
@@ -315,6 +323,16 @@ export function BlurToolSheet({
   };
 
   const updateBlur = (id: string, patch: Partial<BlurEffect>, opts?: ProjectPatchOptions) => {
+    const keys = Object.keys(patch);
+    const isLockOrVisOnly = keys.length > 0 && keys.every((k) => k === 'locked' || k === 'enabled');
+    if (!isLockOrVisOnly) {
+      const target = project.blurs.find((b) => b.id === id);
+      if (target?.locked) {
+        notifyLocked();
+        return;
+      }
+    }
+    if (errorMsg === LOCKED_LAYER_MESSAGE) setErrorMsg(null);
     onPatchProject(
       project.id,
       (cur) => ({
@@ -330,6 +348,10 @@ export function BlurToolSheet({
   };
 
   const duplicateBlur = (orig: BlurEffect) => {
+    if (orig.locked) {
+      notifyLocked();
+      return;
+    }
     const copyId = uuidv4();
     const offset = clampNormBox({
       x: orig.x + 0.03,
@@ -360,6 +382,11 @@ export function BlurToolSheet({
   };
 
   const removeBlur = (id: string) => {
+    const target = project.blurs.find((b) => b.id === id);
+    if (target?.locked) {
+      notifyLocked();
+      return;
+    }
     const remaining = project.blurs.filter((b) => b.id !== id);
     onPatchProject(
       project.id,
@@ -387,6 +414,10 @@ export function BlurToolSheet({
   };
 
   const handleSetSubtitleLink = (blur: BlurEffect, nextLink: BlurSubtitleLink) => {
+    if (blur.locked) {
+      notifyLocked();
+      return;
+    }
     if (nextLink.mode === 'manual') {
       const span = resolveBlurIntervals(blur, project);
       const startTime = span[0]?.start ?? blur.startTime;
@@ -415,6 +446,10 @@ export function BlurToolSheet({
   };
 
   const handleRunMotionTracking = async (blur: BlurEffect) => {
+    if (blur.locked) {
+      notifyLocked();
+      return;
+    }
     if (!videoRef.current || !project.sourceVideoUrl) {
       setErrorMsg('Load a video before running motion tracking.');
       return;
@@ -439,6 +474,10 @@ export function BlurToolSheet({
   };
 
   const handleCaptureForegroundMatte = async (blur: BlurEffect) => {
+    if (blur.locked) {
+      notifyLocked();
+      return;
+    }
     if (!videoRef.current || !project.sourceVideoUrl) {
       setErrorMsg('Load a video before running foreground segmentation.');
       return;
@@ -833,6 +872,21 @@ export function BlurToolSheet({
       {/* SECTION 4: Selected Mask Editor */}
       {selectedBlur && (
         <div className="space-y-3">
+          {selectedBlur.locked && (
+            <div className="px-3 py-2 rounded-xl bg-amber-500/12 border border-amber-500/35 text-xs text-amber-200 flex items-center justify-between gap-2">
+              <span className="flex items-center gap-1.5 min-w-0">
+                <Lock className="w-3.5 h-3.5 text-amber-400 shrink-0" />
+                <span className="truncate">Layer locked — editing blocked</span>
+              </span>
+              <button
+                type="button"
+                onClick={() => updateBlur(selectedBlur.id, { locked: false })}
+                className="min-h-[28px] px-2.5 py-0.5 rounded-lg bg-amber-500/20 hover:bg-amber-500/30 border border-amber-400/40 text-[11px] font-semibold text-amber-100 shrink-0 cursor-pointer"
+              >
+                Unlock
+              </button>
+            </div>
+          )}
           <div className="p-3 rounded-xl bg-[#18181D] border border-white/[0.08] space-y-3">
             {/* Mask Name + Reset */}
             <div className="flex items-center gap-2">
@@ -1004,13 +1058,17 @@ export function BlurToolSheet({
                 <div className="flex flex-wrap gap-2 pt-1 border-t border-white/[0.06]">
                   <button
                     type="button"
-                    onClick={() =>
+                    onClick={() => {
+                      if (selectedBlur.locked) {
+                        notifyLocked();
+                        return;
+                      }
                       onSetDrawMode(
                         drawMode === selectedBlur.mode
                           ? 'none'
                           : (selectedBlur.mode as 'selective' | 'motion')
-                      )
-                    }
+                      );
+                    }}
                     className={`min-h-[38px] flex-1 px-3 py-1.5 rounded-lg text-xs font-medium flex items-center justify-center gap-1.5 cursor-pointer ${
                       drawMode === selectedBlur.mode
                         ? 'bg-violet-600 text-white'

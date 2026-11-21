@@ -9,6 +9,7 @@ import {
   Film,
   Layers,
   Layers3,
+  Lock,
   Maximize2,
   Mic,
   Minimize2,
@@ -21,6 +22,7 @@ import {
   Type,
   Undo2,
   Unlink,
+  Unlock,
   Volume2,
   VolumeX,
   Wand2,
@@ -58,10 +60,19 @@ import {
   getTimelineAudioClipEnd,
   getVideoClipTimelineDuration,
   getVideoClipTimelineEnd,
+  getVideoTimelineTotalDuration,
   unlinkVideoClipAudio,
 } from '../lib/videoTimeline';
 import { getBlurTimelineSpan, resolveBlurIntervals } from '../lib/blurMasks';
 import { getEffectCatalogEntry, getFilterPresetMeta } from '../lib/videoFiltersCatalog';
+import {
+  getSelectedLayerTiming,
+  isTrackLocked,
+  LOCKED_LAYER_MESSAGE,
+  TimelineTrackId,
+  toggleSelectionLockPatch,
+  toggleTrackLockPatch,
+} from '../lib/layerLock';
 
 interface TimelineEditorProps {
   project: Project;
@@ -83,6 +94,7 @@ interface TimelineEditorProps {
   canRedo?: boolean;
   expanded?: boolean;
   onToggleExpanded?: () => void;
+  onNotify?: (msg: string) => void;
 }
 
 type TrackDensity = 'compact' | 'standard' | 'tall';
@@ -111,7 +123,17 @@ interface ClipDragState {
   origSourceEnd?: number;
   clipSpeed?: number;
   maxSourceDuration?: number;
+  locked?: boolean;
   hasMoved: boolean;
+}
+
+function computeClipGeometry(start: number, end: number, totalDuration: number) {
+  const safeDur = Math.max(0.01, totalDuration);
+  const clampedStart = Math.max(0, start);
+  const clampedEnd = Math.max(clampedStart, end);
+  const left = Math.max(0, Math.min(100, (clampedStart / safeDur) * 100));
+  const width = Math.max(0, Math.min(100 - left, ((clampedEnd - clampedStart) / safeDur) * 100));
+  return { left, width };
 }
 
 function WaveformSvg({
@@ -207,6 +229,7 @@ export function TimelineEditor({
   canRedo = false,
   expanded = false,
   onToggleExpanded,
+  onNotify,
 }: TimelineEditorProps) {
   const [zoom, setZoom] = useState(1);
   const [density, setDensity] = useState<TrackDensity>('standard');
@@ -486,6 +509,27 @@ export function TimelineEditor({
       .catch(() => {});
   };
 
+  const selectedTiming = useMemo(
+    () => getSelectedLayerTiming(project, selectedElement ?? null, currentTime),
+    [project, selectedElement, currentTime]
+  );
+
+  const handleToggleTrackLock = useCallback(
+    (trackId: TimelineTrackId) => {
+      const res = toggleTrackLockPatch(projectRef.current, trackId);
+      patchProjectImmediate(() => res.patch);
+      onNotify?.(res.locked ? `Locked ${res.label}.` : `Unlocked ${res.label}.`);
+    },
+    [onNotify]
+  );
+
+  const handleToggleSelectedLock = useCallback(() => {
+    const res = toggleSelectionLockPatch(projectRef.current, selectedElement ?? null, currentTime);
+    if (!res) return;
+    patchProjectImmediate(() => res.patch);
+    onNotify?.(res.locked ? `Locked ${res.label}.` : `Unlocked ${res.label}.`);
+  }, [currentTime, onNotify, selectedElement]);
+
   const startClipDrag = (
     e: React.PointerEvent<HTMLElement>,
     params: {
@@ -500,9 +544,14 @@ export function TimelineEditor({
       origSourceEnd?: number;
       clipSpeed?: number;
       maxSourceDuration?: number;
+      locked?: boolean;
     }
   ) => {
     e.stopPropagation();
+    if (params.locked && params.mode !== 'move') {
+      onNotify?.(LOCKED_LAYER_MESSAGE);
+      return;
+    }
     const area = trackAreaRef.current;
     if (!area || (!onPatchProject && !onProjectUpdated)) return;
 
@@ -512,6 +561,7 @@ export function TimelineEditor({
       hasMoved: false,
     };
     clipDragRef.current = drag;
+    let notifiedLocked = false;
 
     const minDur = 0.25;
     const buildClipPatch = (
@@ -898,6 +948,13 @@ export function TimelineEditor({
         drag.hasMoved = true;
       }
       if (!drag.hasMoved) return;
+      if (drag.locked) {
+        if (!notifiedLocked) {
+          notifiedLocked = true;
+          onNotify?.(LOCKED_LAYER_MESSAGE);
+        }
+        return;
+      }
       const res = computeBounds(moveEvt.clientX);
       const durSec = Math.max(0.1, res.nextEnd - res.nextStart);
       const xPct = Math.max(8, Math.min(92, (((res.nextStart + res.nextEnd) / 2) / Math.max(0.1, duration)) * 100));
@@ -925,15 +982,17 @@ export function TimelineEditor({
         window.setTimeout(() => {
           suppressClickRef.current = false;
         }, 60);
-        const res = computeBounds(endEvt.clientX);
-        applyTimes(
-          res.nextStart,
-          res.nextEnd,
-          res.nextTrimStart,
-          true,
-          res.nextSourceStart,
-          res.nextSourceEnd
-        );
+        if (!drag.locked) {
+          const res = computeBounds(endEvt.clientX);
+          applyTimes(
+            res.nextStart,
+            res.nextEnd,
+            res.nextTrimStart,
+            true,
+            res.nextSourceStart,
+            res.nextSourceEnd
+          );
+        }
       }
       clipDragRef.current = null;
     };
@@ -1334,6 +1393,64 @@ export function TimelineEditor({
         </div>
       </div>
 
+      {/* Selected Layer Duration & End Timing Bar (Desktop & Mobile) */}
+      {selectedTiming && (
+        <div
+          data-testid="selected-layer-timing-bar"
+          className="h-8 lg:h-7 px-2.5 sm:px-3 border-b border-white/[0.07] bg-[#101016] flex items-center justify-between gap-2 text-[11px] shrink-0 overflow-x-auto no-scrollbar"
+        >
+          <div className="flex items-center gap-2 min-w-0 shrink-0">
+            <span className="text-[10px] font-semibold uppercase tracking-wider text-violet-300 shrink-0">
+              {selectedTiming.category}
+            </span>
+            <span className="text-zinc-200 font-medium truncate max-w-[140px] sm:max-w-[210px]">
+              {selectedTiming.label}
+            </span>
+            {selectedTiming.locked && (
+              <span className="inline-flex items-center gap-1 text-[10px] font-medium text-amber-300 shrink-0">
+                <Lock className="w-2.5 h-2.5" />
+                Locked
+              </span>
+            )}
+          </div>
+
+          <div className="flex items-center gap-2.5 sm:gap-3.5 shrink-0 font-mono tabular-nums text-[10.5px]">
+            <span className="text-zinc-400 whitespace-nowrap">
+              Start <span className="text-zinc-100">{formatTimecode(selectedTiming.start)}</span>
+            </span>
+            <span className="text-zinc-400 whitespace-nowrap">
+              End <span className="text-emerald-300">{formatTimecode(selectedTiming.end)}</span>
+            </span>
+            <span className="text-zinc-400 whitespace-nowrap">
+              Dur <span className="text-violet-200 font-semibold">{formatTimecode(selectedTiming.duration)}</span>
+            </span>
+            {selectedTiming.fps !== undefined && selectedTiming.durationFrames !== undefined && (
+              <span className="hidden md:inline text-zinc-500 whitespace-nowrap">
+                {selectedTiming.durationFrames}f @ {selectedTiming.fps}fps
+              </span>
+            )}
+            <button
+              type="button"
+              onClick={handleToggleSelectedLock}
+              title={selectedTiming.locked ? 'Unlock selected layer' : 'Lock selected layer'}
+              aria-label={selectedTiming.locked ? 'Unlock selected layer' : 'Lock selected layer'}
+              className={`min-h-[24px] px-1.5 py-0.5 rounded border text-[10px] font-sans font-medium flex items-center gap-1 cursor-pointer shrink-0 transition-colors ${
+                selectedTiming.locked
+                  ? 'bg-amber-500/20 border-amber-400/50 text-amber-200 hover:bg-amber-500/30'
+                  : 'bg-[#181822] border-white/[0.08] text-zinc-300 hover:text-white'
+              }`}
+            >
+              {selectedTiming.locked ? (
+                <Lock className="w-2.5 h-2.5" />
+              ) : (
+                <Unlock className="w-2.5 h-2.5" />
+              )}
+              <span>{selectedTiming.locked ? 'Unlock' : 'Lock'}</span>
+            </button>
+          </div>
+        </div>
+      )}
+
       {/* 3-Column Timeline Shell on Desktop (>= lg) | Full-Width Track Canvas on Mobile (< lg) */}
       <div className="flex-1 min-h-0 flex overflow-hidden relative">
         {/* LEFT: FIXED TRACK LABELS COLUMN (Desktop only >= lg) */}
@@ -1341,7 +1458,7 @@ export function TimelineEditor({
           ref={leftColRef}
           onScroll={(e) => syncVerticalFromSide(e.currentTarget)}
           style={centerHScrollbarPx > 0 ? { paddingBottom: `${centerHScrollbarPx}px` } : undefined}
-          className="hidden lg:flex w-[148px] shrink-0 bg-[#121218] border-r border-white/[0.09] overflow-y-auto overflow-x-hidden no-scrollbar flex-col"
+          className="hidden lg:flex w-[172px] shrink-0 bg-[#121218] border-r border-white/[0.09] overflow-y-auto overflow-x-hidden no-scrollbar flex-col"
         >
           {/* Corner Sticky Header aligned with Time Ruler (h-7) */}
           <div className="sticky top-0 z-40 h-7 shrink-0 bg-[#14141B] border-b border-white/[0.08] px-2.5 flex items-center justify-between">
@@ -1358,6 +1475,8 @@ export function TimelineEditor({
               <TrackHeader
                 heightPx={videoRowHeightPx}
                 active={selectedElement?.kind === 'video'}
+                locked={isTrackLocked(project, 'video')}
+                onToggleLock={() => handleToggleTrackLock('video')}
                 accentClass="border-l-violet-500"
                 icon={<Film className="w-3.5 h-3.5 text-violet-400 shrink-0" />}
                 label="Video"
@@ -1373,7 +1492,7 @@ export function TimelineEditor({
                         canvas: { ...canvasConfig, videoVisible: !videoVisible },
                       })
                     }
-                    className="w-7 h-7 rounded hover:bg-white/[0.08] flex items-center justify-center text-zinc-400 hover:text-white cursor-pointer shrink-0"
+                    className="w-6 h-6 rounded hover:bg-white/[0.08] flex items-center justify-center text-zinc-400 hover:text-white cursor-pointer shrink-0"
                     title={videoVisible ? 'Hide Video Layer' : 'Show Video Layer'}
                   >
                     {videoVisible ? <Eye className="w-3.5 h-3.5" /> : <EyeOff className="w-3.5 h-3.5 text-zinc-600" />}
@@ -1385,6 +1504,8 @@ export function TimelineEditor({
               <TrackHeader
                 heightPx={trackRowHeightPx}
                 active={isCaptionTrackSelected}
+                locked={isTrackLocked(project, 'captions')}
+                onToggleLock={() => handleToggleTrackLock('captions')}
                 accentClass="border-l-amber-400"
                 icon={<Captions className="w-3.5 h-3.5 text-amber-400 shrink-0" />}
                 label="Captions"
@@ -1408,7 +1529,7 @@ export function TimelineEditor({
                         },
                       });
                     }}
-                    className="w-7 h-7 rounded hover:bg-white/[0.08] flex items-center justify-center text-zinc-400 hover:text-white cursor-pointer shrink-0"
+                    className="w-6 h-6 rounded hover:bg-white/[0.08] flex items-center justify-center text-zinc-400 hover:text-white cursor-pointer shrink-0"
                     title={captionsVisible ? 'Hide Captions' : 'Show Captions'}
                   >
                     {captionsVisible ? <Eye className="w-3.5 h-3.5" /> : <EyeOff className="w-3.5 h-3.5 text-zinc-600" />}
@@ -1420,6 +1541,8 @@ export function TimelineEditor({
               <TrackHeader
                 heightPx={trackRowHeightPx}
                 active={selectedElement?.kind === 'audio' && (!selectedElement.track || selectedElement.track === 'dub')}
+                locked={isTrackLocked(project, 'dub')}
+                onToggleLock={() => handleToggleTrackLock('dub')}
                 accentClass="border-l-teal-400"
                 icon={<Mic className="w-3.5 h-3.5 text-teal-400 shrink-0" />}
                 label="Narration"
@@ -1451,7 +1574,7 @@ export function TimelineEditor({
                         };
                       });
                     }}
-                    className="w-7 h-7 rounded hover:bg-white/[0.08] flex items-center justify-center text-zinc-400 hover:text-white cursor-pointer shrink-0"
+                    className="w-6 h-6 rounded hover:bg-white/[0.08] flex items-center justify-center text-zinc-400 hover:text-white cursor-pointer shrink-0"
                     title={dubMuted ? 'Unmute Narration' : 'Mute Narration'}
                   >
                     {dubMuted ? <VolumeX className="w-3.5 h-3.5 text-red-400" /> : <Volume2 className="w-3.5 h-3.5 text-teal-300" />}
@@ -1463,6 +1586,8 @@ export function TimelineEditor({
               <TrackHeader
                 heightPx={trackRowHeightPx}
                 active={selectedElement?.kind === 'audio' && selectedElement.track === 'orig'}
+                locked={isTrackLocked(project, 'orig')}
+                onToggleLock={() => handleToggleTrackLock('orig')}
                 accentClass="border-l-cyan-400"
                 icon={<Volume2 className="w-3.5 h-3.5 text-cyan-400 shrink-0" />}
                 label="Original Audio"
@@ -1490,7 +1615,7 @@ export function TimelineEditor({
                         };
                       });
                     }}
-                    className="w-7 h-7 rounded hover:bg-white/[0.08] flex items-center justify-center text-zinc-400 hover:text-white cursor-pointer shrink-0"
+                    className="w-6 h-6 rounded hover:bg-white/[0.08] flex items-center justify-center text-zinc-400 hover:text-white cursor-pointer shrink-0"
                     title={origTrackMuted ? 'Unmute Original Audio' : 'Mute Original Audio'}
                   >
                     {origTrackMuted ? <VolumeX className="w-3.5 h-3.5 text-zinc-500" /> : <Volume2 className="w-3.5 h-3.5 text-cyan-300" />}
@@ -1502,6 +1627,8 @@ export function TimelineEditor({
               <TrackHeader
                 heightPx={trackRowHeightPx}
                 active={selectedElement?.kind === 'audio' && selectedElement.track === 'bgm'}
+                locked={isTrackLocked(project, 'bgm')}
+                onToggleLock={() => handleToggleTrackLock('bgm')}
                 accentClass="border-l-indigo-400"
                 icon={<Music className="w-3.5 h-3.5 text-indigo-400 shrink-0" />}
                 label="Music"
@@ -1533,7 +1660,7 @@ export function TimelineEditor({
                         };
                       });
                     }}
-                    className="w-7 h-7 rounded hover:bg-white/[0.08] flex items-center justify-center text-zinc-400 hover:text-white cursor-pointer shrink-0"
+                    className="w-6 h-6 rounded hover:bg-white/[0.08] flex items-center justify-center text-zinc-400 hover:text-white cursor-pointer shrink-0"
                     title={bgMusicMuted ? 'Unmute Music' : 'Mute Music'}
                   >
                     {bgMusicMuted ? <VolumeX className="w-3.5 h-3.5 text-zinc-500" /> : <Volume2 className="w-3.5 h-3.5 text-indigo-300" />}
@@ -1545,6 +1672,8 @@ export function TimelineEditor({
               <TrackHeader
                 heightPx={trackRowHeightPx}
                 active={selectedElement?.kind === 'audio' && selectedElement.track === 'sfx'}
+                locked={isTrackLocked(project, 'sfx')}
+                onToggleLock={() => handleToggleTrackLock('sfx')}
                 accentClass="border-l-emerald-400"
                 icon={<Zap className="w-3.5 h-3.5 text-emerald-400 shrink-0" />}
                 label="SFX"
@@ -1576,7 +1705,7 @@ export function TimelineEditor({
                         };
                       });
                     }}
-                    className="w-7 h-7 rounded hover:bg-white/[0.08] flex items-center justify-center text-zinc-400 hover:text-white cursor-pointer shrink-0"
+                    className="w-6 h-6 rounded hover:bg-white/[0.08] flex items-center justify-center text-zinc-400 hover:text-white cursor-pointer shrink-0"
                     title={sfxMuted ? 'Unmute SFX' : 'Mute SFX'}
                   >
                     {sfxMuted ? <VolumeX className="w-3.5 h-3.5 text-zinc-500" /> : <Volume2 className="w-3.5 h-3.5 text-emerald-300" />}
@@ -1588,6 +1717,8 @@ export function TimelineEditor({
               <TrackHeader
                 heightPx={trackRowHeightPx}
                 active={selectedElement?.kind === 'logo' || selectedElement?.kind === 'caption-element'}
+                locked={isTrackLocked(project, 'overlays')}
+                onToggleLock={() => handleToggleTrackLock('overlays')}
                 accentClass="border-l-purple-400"
                 icon={<Layers className="w-3.5 h-3.5 text-purple-400 shrink-0" />}
                 label="Overlays & Text"
@@ -1621,7 +1752,7 @@ export function TimelineEditor({
                         },
                       });
                     }}
-                    className="w-7 h-7 rounded hover:bg-white/[0.08] flex items-center justify-center text-zinc-400 hover:text-white cursor-pointer shrink-0"
+                    className="w-6 h-6 rounded hover:bg-white/[0.08] flex items-center justify-center text-zinc-400 hover:text-white cursor-pointer shrink-0"
                     title={overlaysVisible ? 'Hide Overlays' : 'Show Overlays'}
                   >
                     {overlaysVisible ? <Eye className="w-3.5 h-3.5" /> : <EyeOff className="w-3.5 h-3.5 text-zinc-600" />}
@@ -1633,6 +1764,8 @@ export function TimelineEditor({
               <TrackHeader
                 heightPx={trackRowHeightPx}
                 active={selectedElement?.kind === 'blur'}
+                locked={isTrackLocked(project, 'blur')}
+                onToggleLock={() => handleToggleTrackLock('blur')}
                 accentClass="border-l-sky-400"
                 icon={<Droplet className="w-3.5 h-3.5 text-sky-400 shrink-0" />}
                 label="Blur"
@@ -1653,7 +1786,7 @@ export function TimelineEditor({
                         blurs: project.blurs.map((b) => ({ ...b, enabled: next })),
                       });
                     }}
-                    className="w-7 h-7 rounded hover:bg-white/[0.08] flex items-center justify-center text-zinc-400 hover:text-white cursor-pointer shrink-0"
+                    className="w-6 h-6 rounded hover:bg-white/[0.08] flex items-center justify-center text-zinc-400 hover:text-white cursor-pointer shrink-0"
                     title={blursVisible ? 'Disable Blurs' : 'Enable Blurs'}
                   >
                     {blursVisible ? <Eye className="w-3.5 h-3.5" /> : <EyeOff className="w-3.5 h-3.5 text-zinc-600" />}
@@ -1665,6 +1798,8 @@ export function TimelineEditor({
               <TrackHeader
                 heightPx={trackRowHeightPx}
                 active={selectedElement?.kind === 'filter'}
+                locked={isTrackLocked(project, 'filters')}
+                onToggleLock={() => handleToggleTrackLock('filters')}
                 accentClass="border-l-pink-400"
                 icon={<Wand2 className="w-3.5 h-3.5 text-pink-400 shrink-0" />}
                 label="Filters"
@@ -1697,7 +1832,7 @@ export function TimelineEditor({
                         };
                       });
                     }}
-                    className="w-7 h-7 rounded hover:bg-white/[0.08] flex items-center justify-center text-zinc-400 hover:text-white cursor-pointer shrink-0"
+                    className="w-6 h-6 rounded hover:bg-white/[0.08] flex items-center justify-center text-zinc-400 hover:text-white cursor-pointer shrink-0"
                     title={filtersVisible ? 'Toggle stacked filters' : 'Open Filters'}
                   >
                     {filtersVisible ? (
@@ -1713,6 +1848,8 @@ export function TimelineEditor({
               <TrackHeader
                 heightPx={trackRowHeightPx}
                 active={selectedElement?.kind === 'effect'}
+                locked={isTrackLocked(project, 'effects')}
+                onToggleLock={() => handleToggleTrackLock('effects')}
                 accentClass="border-l-fuchsia-400"
                 icon={<Sparkles className="w-3.5 h-3.5 text-fuchsia-400 shrink-0" />}
                 label="Effects"
@@ -1745,7 +1882,7 @@ export function TimelineEditor({
                         };
                       });
                     }}
-                    className="w-7 h-7 rounded hover:bg-white/[0.08] flex items-center justify-center text-zinc-400 hover:text-white cursor-pointer shrink-0"
+                    className="w-6 h-6 rounded hover:bg-white/[0.08] flex items-center justify-center text-zinc-400 hover:text-white cursor-pointer shrink-0"
                     title={effectsVisible ? 'Disable Effects' : 'Enable Effects'}
                   >
                     {effectsVisible ? (
@@ -1848,9 +1985,13 @@ export function TimelineEditor({
                   {videoClips.map((clip, idx) => {
                     const clipEnd = getVideoClipTimelineEnd(clip);
                     const clipDur = getVideoClipTimelineDuration(clip);
-                    const left = (clip.timelineStart / duration) * 100;
-                    const width = Math.max(3, (clipDur / duration) * 100);
+                    const { left, width } = computeClipGeometry(
+                      clip.timelineStart,
+                      clipEnd,
+                      duration
+                    );
                     const isSel = isVideoClipSelected(clip.id);
+                    const isLocked = Boolean(project.canvas?.videoLocked || clip.locked);
                     const hasCustomSpeed = Math.abs(clip.speed - 1.0) > 0.01;
                     const thumbCount = Math.max(3, Math.min(18, Math.round((width / 100) * 16 * zoom)));
                     const thumbs = getClipThumbnails(clip.sourceStart, clip.sourceEnd, thumbCount);
@@ -1865,6 +2006,7 @@ export function TimelineEditor({
                     return (
                       <div
                         key={clip.id}
+                        data-testid={`timeline-video-clip-${clip.id}`}
                         onPointerDown={(e) =>
                           startClipDrag(e, {
                             kind: 'video-clip',
@@ -1876,6 +2018,7 @@ export function TimelineEditor({
                             origSourceEnd: clip.sourceEnd,
                             clipSpeed: clip.speed,
                             maxSourceDuration: srcDuration,
+                            locked: isLocked,
                           })
                         }
                         onClick={(e) => {
@@ -1883,38 +2026,47 @@ export function TimelineEditor({
                           if (suppressClickRef.current) return;
                           onSelectElement?.({ kind: 'video', clipId: clip.id });
                         }}
-                        style={{ left: `${left}%`, width: `${width}%` }}
-                        title={`${clip.label || `Clip ${idx + 1}`} · ${clip.speed}x (${clipDur.toFixed(
+                        style={{ left: `${left}%`, width: `${width}%`, minWidth: '4px' }}
+                        title={`${clip.label || `Clip ${idx + 1}`} · ${clip.speed}x (${clip.timelineStart.toFixed(
                           2
-                        )}s timeline)`}
-                        className={`group absolute inset-y-0.5 rounded-md flex items-center justify-between overflow-hidden cursor-grab active:cursor-grabbing border touch-none bg-zinc-900 ${
+                        )}s → ${clipEnd.toFixed(2)}s · ${clipDur.toFixed(2)}s)${isLocked ? ' · Locked' : ''}`}
+                        className={`group absolute inset-y-0.5 rounded-md flex items-center justify-between overflow-hidden border touch-none bg-zinc-900 ${
+                          isLocked ? 'cursor-pointer' : 'cursor-grab active:cursor-grabbing'
+                        } ${
                           isSel
-                            ? 'border-white ring-2 ring-violet-500/70 z-10'
+                            ? isLocked
+                              ? 'border-amber-400 ring-2 ring-amber-400/60 z-10'
+                              : 'border-white ring-2 ring-violet-500/70 z-10'
+                            : isLocked
+                            ? 'border-amber-400/55 border-dashed'
                             : 'border-white/20 hover:border-white/45'
                         } ${videoVisible ? 'opacity-100' : 'opacity-40'}`}
                       >
-                        <div
-                          onPointerDown={(e) => {
-                            e.stopPropagation();
-                            startClipDrag(e, {
-                              kind: 'video-clip',
-                              id: clip.id,
-                              mode: 'trim-start',
-                              origStart: clip.timelineStart,
-                              origEnd: clipEnd,
-                              origSourceStart: clip.sourceStart,
-                              origSourceEnd: clip.sourceEnd,
-                              clipSpeed: clip.speed,
-                              maxSourceDuration: srcDuration,
-                            });
-                          }}
-                          className={`w-2.5 h-full bg-white hover:bg-violet-100 cursor-ew-resize shrink-0 touch-none flex items-center justify-center z-20 transition-opacity ${
-                            isSel ? 'opacity-100' : 'opacity-0 group-hover:opacity-100'
-                          }`}
-                          title="Trim clip start"
-                        >
-                          <div className="w-[2px] h-3 bg-zinc-800 rounded-full" />
-                        </div>
+                        {!isLocked && (
+                          <div
+                            onPointerDown={(e) => {
+                              e.stopPropagation();
+                              startClipDrag(e, {
+                                kind: 'video-clip',
+                                id: clip.id,
+                                mode: 'trim-start',
+                                origStart: clip.timelineStart,
+                                origEnd: clipEnd,
+                                origSourceStart: clip.sourceStart,
+                                origSourceEnd: clip.sourceEnd,
+                                clipSpeed: clip.speed,
+                                maxSourceDuration: srcDuration,
+                                locked: isLocked,
+                              });
+                            }}
+                            className={`w-2.5 h-full bg-white hover:bg-violet-100 cursor-ew-resize shrink-0 touch-none flex items-center justify-center z-20 transition-opacity ${
+                              isSel ? 'opacity-100' : 'opacity-0 group-hover:opacity-100'
+                            }`}
+                            title="Trim clip start"
+                          >
+                            <div className="w-[2px] h-3 bg-zinc-800 rounded-full" />
+                          </div>
+                        )}
 
                         <div className="flex-1 h-full relative overflow-hidden pointer-events-none">
                           {/* Real extracted filmstrip frames */}
@@ -1950,6 +2102,7 @@ export function TimelineEditor({
                           )}
 
                           <div className="relative z-10 px-1.5 pt-0.5 flex items-center gap-1 text-[10px] font-semibold text-white drop-shadow">
+                            {isLocked && <Lock className="w-2.5 h-2.5 text-amber-300 shrink-0" />}
                             <span className="truncate">
                               {clip.label || project.sourceFilename || `Clip ${idx + 1}`}
                             </span>
@@ -1964,28 +2117,33 @@ export function TimelineEditor({
                           </div>
                         </div>
 
-                        <div
-                          onPointerDown={(e) => {
-                            e.stopPropagation();
-                            startClipDrag(e, {
-                              kind: 'video-clip',
-                              id: clip.id,
-                              mode: 'trim-end',
-                              origStart: clip.timelineStart,
-                              origEnd: clipEnd,
-                              origSourceStart: clip.sourceStart,
-                              origSourceEnd: clip.sourceEnd,
-                              clipSpeed: clip.speed,
-                              maxSourceDuration: srcDuration,
-                            });
-                          }}
-                          className={`w-2.5 h-full bg-white hover:bg-violet-100 cursor-ew-resize shrink-0 touch-none flex items-center justify-center z-20 transition-opacity ${
-                            isSel ? 'opacity-100' : 'opacity-0 group-hover:opacity-100'
-                          }`}
-                          title="Trim clip end"
-                        >
-                          <div className="w-[2px] h-3 bg-zinc-800 rounded-full" />
-                        </div>
+                        {!isLocked && (
+                          <div
+                            onPointerDown={(e) => {
+                              e.stopPropagation();
+                              startClipDrag(e, {
+                                kind: 'video-clip',
+                                id: clip.id,
+                                mode: 'trim-end',
+                                origStart: clip.timelineStart,
+                                origEnd: clipEnd,
+                                origSourceStart: clip.sourceStart,
+                                origSourceEnd: clip.sourceEnd,
+                                clipSpeed: clip.speed,
+                                maxSourceDuration: srcDuration,
+                                locked: isLocked,
+                              });
+                            }}
+                            className={`w-2.5 h-full bg-white hover:bg-violet-100 cursor-ew-resize shrink-0 touch-none flex items-center justify-center z-20 transition-opacity ${
+                              isSel ? 'opacity-100' : 'opacity-0 group-hover:opacity-100'
+                            }`}
+                            title="Trim clip end"
+                          >
+                            <div className="w-[2px] h-3 bg-zinc-800 rounded-full" />
+                          </div>
+                        )}
+
+                        <ClipEndBoundaryMarker locked={isLocked} selected={isSel} endTime={clipEnd} />
                       </div>
                     );
                   })}
@@ -2013,8 +2171,13 @@ export function TimelineEditor({
               >
                 <MobileTrackMicroBadge label="Captions" dotClass="bg-amber-400" />
                 {syncedCaptions.map((cap, idx) => {
-                  const left = (cap.syncedStart / duration) * 100;
-                  const width = Math.max(2, ((cap.syncedEnd - cap.syncedStart) / duration) * 100);
+                  const { left, width } = computeClipGeometry(
+                    cap.syncedStart,
+                    cap.syncedEnd,
+                    duration
+                  );
+                  const rawCap = project.captions.find((c) => c.id === cap.id);
+                  const isLocked = Boolean(project.subtitleStyle.locked || rawCap?.locked);
                   const displayText =
                     (cap.translatedText || '').trim() || (cap.text || '').trim();
                   const hasTranslated = Boolean((cap.translatedText || '').trim());
@@ -2025,16 +2188,16 @@ export function TimelineEditor({
                   return (
                     <div
                       key={cap.id}
-                      onPointerDown={(e) => {
-                        if (project.subtitleStyle.locked) return;
+                      onPointerDown={(e) =>
                         startClipDrag(e, {
                           kind: 'caption',
                           id: cap.id,
                           mode: 'move',
                           origStart: cap.syncedStart,
                           origEnd: cap.syncedEnd,
-                        });
-                      }}
+                          locked: isLocked,
+                        })
+                      }
                       onClick={(e) => {
                         e.stopPropagation();
                         if (suppressClickRef.current) return;
@@ -2043,19 +2206,27 @@ export function TimelineEditor({
                       }}
                       title={`${displayText || `Caption ${idx + 1}`} (${cap.syncedStart.toFixed(
                         2
-                      )}s → ${cap.syncedEnd.toFixed(2)}s)`}
-                      className={`absolute inset-y-0.5 rounded flex items-center justify-between text-[10.5px] font-medium overflow-hidden cursor-grab active:cursor-grabbing border touch-none ${
+                      )}s → ${cap.syncedEnd.toFixed(2)}s)${isLocked ? ' · Locked' : ''}`}
+                      className={`absolute inset-y-0.5 rounded flex items-center justify-between text-[10.5px] font-medium overflow-hidden border touch-none ${
+                        isLocked ? 'cursor-pointer' : 'cursor-grab active:cursor-grabbing'
+                      } ${
                         !hasTranslated
-                          ? 'bg-red-500/30 border-red-400/60 text-red-100'
+                          ? isLocked
+                            ? 'bg-red-500/25 border-amber-400/70 border-dashed text-red-100'
+                            : 'bg-red-500/30 border-red-400/60 text-red-100'
                           : isSel
-                          ? 'bg-amber-400 border-white text-zinc-950 ring-1 ring-white/60 z-10 font-semibold'
+                          ? isLocked
+                            ? 'bg-amber-400 border-amber-200 text-zinc-950 ring-2 ring-amber-300/70 z-10 font-semibold'
+                            : 'bg-amber-400 border-white text-zinc-950 ring-1 ring-white/60 z-10 font-semibold'
                           : isAtPlayhead
                           ? 'bg-amber-500/95 border-amber-200 text-zinc-950'
+                          : isLocked
+                          ? 'bg-amber-500/65 border-amber-300/70 border-dashed text-zinc-950'
                           : 'bg-amber-500/75 hover:bg-amber-500/90 border-amber-300/40 text-zinc-950'
                       }`}
-                      style={{ left: `${left}%`, width: `${width}%` }}
+                      style={{ left: `${left}%`, width: `${width}%`, minWidth: '4px' }}
                     >
-                      {isSel && !project.subtitleStyle.locked && (
+                      {isSel && !isLocked && (
                         <div
                           onPointerDown={(e) =>
                             startClipDrag(e, {
@@ -2064,16 +2235,18 @@ export function TimelineEditor({
                               mode: 'trim-start',
                               origStart: cap.syncedStart,
                               origEnd: cap.syncedEnd,
+                              locked: isLocked,
                             })
                           }
-                          className="w-2 h-full bg-white cursor-ew-resize shrink-0 touch-none"
+                          className="w-2 h-full bg-white cursor-ew-resize shrink-0 touch-none z-20"
                           title="Trim caption start"
                         />
                       )}
                       <div className="flex items-center gap-1 px-1.5 min-w-0 flex-1 truncate pointer-events-none">
+                        {isLocked && <Lock className="w-2.5 h-2.5 text-zinc-950 shrink-0" />}
                         <span className="truncate">{displayText || `[Caption ${idx + 1}]`}</span>
                       </div>
-                      {isSel && !project.subtitleStyle.locked && (
+                      {isSel && !isLocked && (
                         <div
                           onPointerDown={(e) =>
                             startClipDrag(e, {
@@ -2082,12 +2255,14 @@ export function TimelineEditor({
                               mode: 'trim-end',
                               origStart: cap.syncedStart,
                               origEnd: cap.syncedEnd,
+                              locked: isLocked,
                             })
                           }
-                          className="w-2 h-full bg-white cursor-ew-resize shrink-0 touch-none"
+                          className="w-2 h-full bg-white cursor-ew-resize shrink-0 touch-none z-20"
                           title="Trim caption end"
                         />
                       )}
+                      <ClipEndBoundaryMarker locked={isLocked} selected={isSel} endTime={cap.syncedEnd} />
                     </div>
                   );
                 })}
@@ -2125,12 +2300,12 @@ export function TimelineEditor({
                 <MobileTrackMicroBadge label="Narration" dotClass="bg-teal-400" />
                 {project.voice.generatedClips.length > 0 ? (
                   project.voice.generatedClips.map((clip) => {
-                    const left = (clip.start / duration) * 100;
-                    const width = Math.max(2.5, ((clip.end - clip.start) / duration) * 100);
+                    const { left, width } = computeClipGeometry(clip.start, clip.end, duration);
                     const isSel =
                       selectedElement?.kind === 'audio' &&
                       selectedElement.track === 'dub' &&
                       selectedElement.clipId === clip.segmentId;
+                    const isLocked = Boolean(project.voice.dubLocked || clip.locked);
                     const clipPeaks = audioWaveforms?.dubClips?.[clip.segmentId] || [];
 
                     return (
@@ -2145,6 +2320,7 @@ export function TimelineEditor({
                             origEnd: clip.end,
                             origTrimStart: clip.trimStartSec ?? 0,
                             maxAudioDuration: clip.duration,
+                            locked: isLocked,
                           })
                         }
                         onClick={(e) => {
@@ -2157,38 +2333,47 @@ export function TimelineEditor({
                             clipId: clip.segmentId,
                           });
                         }}
-                        className={`group absolute inset-y-0.5 rounded flex items-center justify-between overflow-hidden cursor-grab active:cursor-grabbing border touch-none ${
+                        className={`group absolute inset-y-0.5 rounded flex items-center justify-between overflow-hidden border touch-none ${
+                          isLocked ? 'cursor-pointer' : 'cursor-grab active:cursor-grabbing'
+                        } ${
                           isSel
-                            ? 'bg-teal-600/90 border-white ring-1 ring-white/50 text-white z-10'
+                            ? isLocked
+                              ? 'bg-teal-700/90 border-amber-400 ring-1 ring-amber-300/60 text-white z-10'
+                              : 'bg-teal-600/90 border-white ring-1 ring-white/50 text-white z-10'
                             : dubMuted
                             ? 'bg-zinc-800/90 border-zinc-700 text-zinc-400'
+                            : isLocked
+                            ? 'bg-teal-800/75 border-amber-400/55 border-dashed text-white'
                             : 'bg-teal-700/80 hover:bg-teal-600/85 border-teal-300/45 text-white'
                         }`}
-                        style={{ left: `${left}%`, width: `${width}%` }}
-                        title={`${clip.text} (${clip.start.toFixed(1)}s → ${clip.end.toFixed(1)}s)`}
+                        style={{ left: `${left}%`, width: `${width}%`, minWidth: '4px' }}
+                        title={`${clip.text} (${clip.start.toFixed(2)}s → ${clip.end.toFixed(2)}s)${isLocked ? ' · Locked' : ''}`}
                       >
-                        <div
-                          onPointerDown={(e) => {
-                            e.stopPropagation();
-                            startClipDrag(e, {
-                              kind: 'dub-clip',
-                              id: clip.segmentId,
-                              mode: 'trim-start',
-                              origStart: clip.start,
-                              origEnd: clip.end,
-                              origTrimStart: clip.trimStartSec ?? 0,
-                              maxAudioDuration: clip.duration,
-                            });
-                          }}
-                          className={`w-2.5 h-full bg-white cursor-ew-resize shrink-0 touch-none flex items-center justify-center z-20 transition-opacity ${
-                            isSel ? 'opacity-100' : 'opacity-0 group-hover:opacity-100'
-                          }`}
-                          title="Trim clip start"
-                        >
-                          <div className="w-[2px] h-3 bg-zinc-800 rounded-full" />
-                        </div>
+                        {!isLocked && (
+                          <div
+                            onPointerDown={(e) => {
+                              e.stopPropagation();
+                              startClipDrag(e, {
+                                kind: 'dub-clip',
+                                id: clip.segmentId,
+                                mode: 'trim-start',
+                                origStart: clip.start,
+                                origEnd: clip.end,
+                                origTrimStart: clip.trimStartSec ?? 0,
+                                maxAudioDuration: clip.duration,
+                                locked: isLocked,
+                              });
+                            }}
+                            className={`w-2.5 h-full bg-white cursor-ew-resize shrink-0 touch-none flex items-center justify-center z-20 transition-opacity ${
+                              isSel ? 'opacity-100' : 'opacity-0 group-hover:opacity-100'
+                            }`}
+                            title="Trim clip start"
+                          >
+                            <div className="w-[2px] h-3 bg-zinc-800 rounded-full" />
+                          </div>
+                        )}
 
-                        <div className="relative flex-1 h-full flex items-center px-1.5 overflow-hidden pointer-events-none">
+                        <div className="relative flex-1 h-full flex items-center gap-1 px-1.5 overflow-hidden pointer-events-none">
                           {clipPeaks.length > 0 && (
                             <div className="absolute inset-0 opacity-75">
                               <WaveformSvg
@@ -2199,60 +2384,94 @@ export function TimelineEditor({
                               />
                             </div>
                           )}
+                          {isLocked && <Lock className="relative z-10 w-2.5 h-2.5 text-amber-300 shrink-0" />}
                           <span className="relative z-10 text-[10px] font-medium truncate drop-shadow">
                             {clip.text}
                           </span>
                         </div>
 
-                        <div
-                          onPointerDown={(e) => {
-                            e.stopPropagation();
-                            startClipDrag(e, {
-                              kind: 'dub-clip',
-                              id: clip.segmentId,
-                              mode: 'trim-end',
-                              origStart: clip.start,
-                              origEnd: clip.end,
-                              origTrimStart: clip.trimStartSec ?? 0,
-                              maxAudioDuration: clip.duration,
-                            });
-                          }}
-                          className={`w-2.5 h-full bg-white cursor-ew-resize shrink-0 touch-none flex items-center justify-center z-20 transition-opacity ${
-                            isSel ? 'opacity-100' : 'opacity-0 group-hover:opacity-100'
-                          }`}
-                          title="Trim clip end"
-                        >
-                          <div className="w-[2px] h-3 bg-zinc-800 rounded-full" />
-                        </div>
+                        {!isLocked && (
+                          <div
+                            onPointerDown={(e) => {
+                              e.stopPropagation();
+                              startClipDrag(e, {
+                                kind: 'dub-clip',
+                                id: clip.segmentId,
+                                mode: 'trim-end',
+                                origStart: clip.start,
+                                origEnd: clip.end,
+                                origTrimStart: clip.trimStartSec ?? 0,
+                                maxAudioDuration: clip.duration,
+                                locked: isLocked,
+                              });
+                            }}
+                            className={`w-2.5 h-full bg-white cursor-ew-resize shrink-0 touch-none flex items-center justify-center z-20 transition-opacity ${
+                              isSel ? 'opacity-100' : 'opacity-0 group-hover:opacity-100'
+                            }`}
+                            title="Trim clip end"
+                          >
+                            <div className="w-[2px] h-3 bg-zinc-800 rounded-full" />
+                          </div>
+                        )}
+                        <ClipEndBoundaryMarker locked={isLocked} selected={isSel} endTime={clip.end} />
                       </div>
                     );
                   })
                 ) : project.voice.fullDubUrl ? (
-                  <div
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      onSelectElement?.({ kind: 'audio', track: 'dub' });
-                    }}
-                    className={`absolute inset-y-0.5 left-0 right-0 rounded px-2 flex items-center gap-2 border overflow-hidden ${
-                      dubMuted
-                        ? 'bg-zinc-900 border-white/[0.06] text-zinc-500'
-                        : 'bg-teal-700/75 border-teal-300/45 text-white'
-                    }`}
-                  >
-                    {audioWaveforms?.dub && audioWaveforms.dub.length > 0 && (
-                      <div className="absolute inset-0 opacity-75">
-                        <WaveformSvg
-                          peaks={audioWaveforms.dub}
-                          color="rgba(153, 246, 228, 0.9)"
-                          muted={dubMuted}
-                          bars={96}
-                        />
+                  (() => {
+                    const dubStart = Math.max(0, project.voice.timingOffsetSec || 0);
+                    const dubEnd = Math.min(
+                      duration,
+                      Math.max(
+                        dubStart + 0.2,
+                        project.voice.syncPlan?.estimatedFinalDuration || srcDuration
+                      )
+                    );
+                    const { left, width } = computeClipGeometry(dubStart, dubEnd, duration);
+                    const dubLocked = Boolean(project.voice.dubLocked);
+                    const isSel =
+                      selectedElement?.kind === 'audio' &&
+                      (!selectedElement.track || selectedElement.track === 'dub');
+                    return (
+                      <div
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          onSelectElement?.({ kind: 'audio', track: 'dub' });
+                        }}
+                        style={{ left: `${left}%`, width: `${width}%`, minWidth: '4px' }}
+                        title={`${project.voice.fishVoiceTitle || 'Narration Track'} (${dubStart.toFixed(
+                          2
+                        )}s → ${dubEnd.toFixed(2)}s)${dubLocked ? ' · Locked' : ''}`}
+                        className={`absolute inset-y-0.5 rounded px-2 flex items-center gap-1.5 border overflow-hidden ${
+                          isSel
+                            ? dubLocked
+                              ? 'bg-teal-700/85 border-amber-400 text-white'
+                              : 'bg-teal-600/85 border-white text-white'
+                            : dubMuted
+                            ? 'bg-zinc-900 border-white/[0.06] text-zinc-500'
+                            : dubLocked
+                            ? 'bg-teal-800/70 border-amber-400/55 border-dashed text-white'
+                            : 'bg-teal-700/75 border-teal-300/45 text-white'
+                        }`}
+                      >
+                        {audioWaveforms?.dub && audioWaveforms.dub.length > 0 && (
+                          <div className="absolute inset-0 opacity-75">
+                            <WaveformSvg
+                              peaks={audioWaveforms.dub}
+                              color="rgba(153, 246, 228, 0.9)"
+                              muted={dubMuted}
+                              bars={96}
+                            />
+                          </div>
+                        )}
+                        {dubLocked && <Lock className="relative z-10 w-2.5 h-2.5 text-amber-300 shrink-0" />}
+                        <span className="relative z-10 text-[10.5px] font-medium truncate drop-shadow">
+                          {project.voice.fishVoiceTitle || 'Narration Track'}
+                        </span>
+                        <ClipEndBoundaryMarker locked={dubLocked} selected={isSel} endTime={dubEnd} />
                       </div>
-                    )}
-                    <span className="relative z-10 text-[10.5px] font-medium shrink-0 drop-shadow">
-                      {project.voice.fishVoiceTitle || 'Narration Track'}
-                    </span>
-                  </div>
+                    );
+                  })()
                 ) : (
                   <button
                     type="button"
@@ -2288,12 +2507,16 @@ export function TimelineEditor({
                   hasUnlinkedAudio ? (
                     originalAudioClips.map((oa, idx) => {
                       const oaEnd = getOriginalAudioClipTimelineEnd(oa);
-                      const left = (oa.timelineStart / duration) * 100;
-                      const width = Math.max(2.5, ((oaEnd - oa.timelineStart) / duration) * 100);
+                      const { left, width } = computeClipGeometry(
+                        oa.timelineStart,
+                        oaEnd,
+                        duration
+                      );
                       const isSel =
                         selectedElement?.kind === 'audio' &&
                         selectedElement.track === 'orig' &&
                         (!selectedElement.clipId || selectedElement.clipId === oa.id);
+                      const isLocked = Boolean(project.voice.origLocked || oa.locked);
                       const isClipMuted = origTrackMuted || Boolean(oa.muted);
                       const oaPeaks = slicePeaksByRatio(
                         origPeaks,
@@ -2314,6 +2537,7 @@ export function TimelineEditor({
                               origSourceStart: oa.sourceStart,
                               origSourceEnd: oa.sourceEnd,
                               maxSourceDuration: srcDuration,
+                              locked: isLocked,
                             })
                           }
                           onClick={(e) => {
@@ -2321,41 +2545,50 @@ export function TimelineEditor({
                             if (suppressClickRef.current) return;
                             onSelectElement?.({ kind: 'audio', track: 'orig', clipId: oa.id });
                           }}
-                          style={{ left: `${left}%`, width: `${width}%` }}
+                          style={{ left: `${left}%`, width: `${width}%`, minWidth: '4px' }}
                           title={`${oa.label || `Original Audio ${idx + 1}`} · 1.0x (${oa.timelineStart.toFixed(
                             2
-                          )}s → ${oaEnd.toFixed(2)}s)`}
-                          className={`group absolute inset-y-0.5 rounded flex items-center justify-between text-[10px] font-medium overflow-hidden cursor-grab active:cursor-grabbing border touch-none ${
+                          )}s → ${oaEnd.toFixed(2)}s)${isLocked ? ' · Locked' : ''}`}
+                          className={`group absolute inset-y-0.5 rounded flex items-center justify-between text-[10px] font-medium overflow-hidden border touch-none ${
+                            isLocked ? 'cursor-pointer' : 'cursor-grab active:cursor-grabbing'
+                          } ${
                             isSel
-                              ? 'bg-cyan-600/90 border-white ring-1 ring-white/50 text-white z-10'
+                              ? isLocked
+                                ? 'bg-cyan-700/90 border-amber-400 ring-1 ring-amber-300/60 text-white z-10'
+                                : 'bg-cyan-600/90 border-white ring-1 ring-white/50 text-white z-10'
                               : isClipMuted
                               ? 'bg-zinc-900 border-zinc-700 text-zinc-500'
+                              : isLocked
+                              ? 'bg-cyan-800/70 border-amber-400/55 border-dashed text-white'
                               : 'bg-cyan-700/75 hover:bg-cyan-600/85 border-cyan-300/45 text-white'
                           }`}
                         >
-                          <div
-                            onPointerDown={(e) => {
-                              e.stopPropagation();
-                              startClipDrag(e, {
-                                kind: 'orig-clip',
-                                id: oa.id,
-                                mode: 'trim-start',
-                                origStart: oa.timelineStart,
-                                origEnd: oaEnd,
-                                origSourceStart: oa.sourceStart,
-                                origSourceEnd: oa.sourceEnd,
-                                maxSourceDuration: srcDuration,
-                              });
-                            }}
-                            className={`w-2.5 h-full bg-white cursor-ew-resize shrink-0 touch-none flex items-center justify-center z-20 transition-opacity ${
-                              isSel ? 'opacity-100' : 'opacity-0 group-hover:opacity-100'
-                            }`}
-                            title="Trim start"
-                          >
-                            <div className="w-[2px] h-3 bg-zinc-800 rounded-full" />
-                          </div>
+                          {!isLocked && (
+                            <div
+                              onPointerDown={(e) => {
+                                e.stopPropagation();
+                                startClipDrag(e, {
+                                  kind: 'orig-clip',
+                                  id: oa.id,
+                                  mode: 'trim-start',
+                                  origStart: oa.timelineStart,
+                                  origEnd: oaEnd,
+                                  origSourceStart: oa.sourceStart,
+                                  origSourceEnd: oa.sourceEnd,
+                                  maxSourceDuration: srcDuration,
+                                  locked: isLocked,
+                                });
+                              }}
+                              className={`w-2.5 h-full bg-white cursor-ew-resize shrink-0 touch-none flex items-center justify-center z-20 transition-opacity ${
+                                isSel ? 'opacity-100' : 'opacity-0 group-hover:opacity-100'
+                              }`}
+                              title="Trim start"
+                            >
+                              <div className="w-[2px] h-3 bg-zinc-800 rounded-full" />
+                            </div>
+                          )}
 
-                          <div className="relative flex-1 h-full flex items-center px-1.5 overflow-hidden pointer-events-none">
+                          <div className="relative flex-1 h-full flex items-center gap-1 px-1.5 overflow-hidden pointer-events-none">
                             {oaPeaks.length > 0 && (
                               <div className="absolute inset-0 opacity-80">
                                 <WaveformSvg
@@ -2366,92 +2599,119 @@ export function TimelineEditor({
                                 />
                               </div>
                             )}
+                            {isLocked && <Lock className="relative z-10 w-2.5 h-2.5 text-amber-300 shrink-0" />}
                             <span className="relative z-10 truncate drop-shadow">
                               {oa.label || 'Original Audio'} · 1.0x
                             </span>
                           </div>
 
-                          <div
-                            onPointerDown={(e) => {
-                              e.stopPropagation();
-                              startClipDrag(e, {
-                                kind: 'orig-clip',
-                                id: oa.id,
-                                mode: 'trim-end',
-                                origStart: oa.timelineStart,
-                                origEnd: oaEnd,
-                                origSourceStart: oa.sourceStart,
-                                origSourceEnd: oa.sourceEnd,
-                                maxSourceDuration: srcDuration,
-                              });
-                            }}
-                            className={`w-2.5 h-full bg-white cursor-ew-resize shrink-0 touch-none flex items-center justify-center z-20 transition-opacity ${
-                              isSel ? 'opacity-100' : 'opacity-0 group-hover:opacity-100'
-                            }`}
-                            title="Trim end"
-                          >
-                            <div className="w-[2px] h-3 bg-zinc-800 rounded-full" />
-                          </div>
+                          {!isLocked && (
+                            <div
+                              onPointerDown={(e) => {
+                                e.stopPropagation();
+                                startClipDrag(e, {
+                                  kind: 'orig-clip',
+                                  id: oa.id,
+                                  mode: 'trim-end',
+                                  origStart: oa.timelineStart,
+                                  origEnd: oaEnd,
+                                  origSourceStart: oa.sourceStart,
+                                  origSourceEnd: oa.sourceEnd,
+                                  maxSourceDuration: srcDuration,
+                                  locked: isLocked,
+                                });
+                              }}
+                              className={`w-2.5 h-full bg-white cursor-ew-resize shrink-0 touch-none flex items-center justify-center z-20 transition-opacity ${
+                                isSel ? 'opacity-100' : 'opacity-0 group-hover:opacity-100'
+                              }`}
+                              title="Trim end"
+                            >
+                              <div className="w-[2px] h-3 bg-zinc-800 rounded-full" />
+                            </div>
+                          )}
+                          <ClipEndBoundaryMarker locked={isLocked} selected={isSel} endTime={oaEnd} />
                         </div>
                       );
                     })
                   ) : (
-                    <div
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        onSelectElement?.({ kind: 'audio', track: 'orig' });
-                      }}
-                      style={{
-                        left: `${((videoClips[0]?.timelineStart || 0) / duration) * 100}%`,
-                        width: `${Math.max(
-                          6,
-                          (((videoClips.length > 0
-                            ? getVideoClipTimelineEnd(videoClips[videoClips.length - 1])
-                            : srcDuration) -
-                            (videoClips[0]?.timelineStart || 0)) /
-                            duration) *
-                            100
-                        )}%`,
-                      }}
-                      className={`absolute inset-y-0.5 rounded px-2 flex items-center justify-between gap-2 border overflow-hidden ${
-                        origTrackMuted
-                          ? 'bg-zinc-900 border-white/[0.06] text-zinc-500'
-                          : 'bg-cyan-700/70 border-cyan-300/45 text-white'
-                      }`}
-                    >
-                      {origPeaks.length > 0 && (
-                        <div className="absolute inset-0 opacity-75">
-                          <WaveformSvg
-                            peaks={origPeaks}
-                            color="rgba(165, 243, 252, 0.85)"
-                            muted={origTrackMuted}
-                            bars={88}
-                          />
+                    (() => {
+                      const linkedStart = videoClips[0]?.timelineStart || 0;
+                      const linkedEnd =
+                        videoClips.length > 0
+                          ? getVideoClipTimelineEnd(videoClips[videoClips.length - 1])
+                          : srcDuration;
+                      const { left, width } = computeClipGeometry(linkedStart, linkedEnd, duration);
+                      const origLocked = Boolean(project.voice.origLocked);
+                      const isSel =
+                        selectedElement?.kind === 'audio' && selectedElement.track === 'orig';
+                      return (
+                        <div
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            onSelectElement?.({ kind: 'audio', track: 'orig' });
+                          }}
+                          style={{ left: `${left}%`, width: `${width}%`, minWidth: '4px' }}
+                          title={`Original Audio (${linkedStart.toFixed(2)}s → ${linkedEnd.toFixed(
+                            2
+                          )}s)${origLocked ? ' · Locked' : ''}`}
+                          className={`absolute inset-y-0.5 rounded px-2 flex items-center justify-between gap-2 border overflow-hidden ${
+                            isSel
+                              ? origLocked
+                                ? 'bg-cyan-700/80 border-amber-400 text-white'
+                                : 'bg-cyan-600/80 border-white text-white'
+                              : origTrackMuted
+                              ? 'bg-zinc-900 border-white/[0.06] text-zinc-500'
+                              : origLocked
+                              ? 'bg-cyan-800/65 border-amber-400/55 border-dashed text-white'
+                              : 'bg-cyan-700/70 border-cyan-300/45 text-white'
+                          }`}
+                        >
+                          {origPeaks.length > 0 && (
+                            <div className="absolute inset-0 opacity-75">
+                              <WaveformSvg
+                                peaks={origPeaks}
+                                color="rgba(165, 243, 252, 0.85)"
+                                muted={origTrackMuted}
+                                bars={88}
+                              />
+                            </div>
+                          )}
+                          <div className="relative z-10 flex items-center gap-1 min-w-0 truncate">
+                            {origLocked && <Lock className="w-2.5 h-2.5 text-amber-300 shrink-0" />}
+                            <span className="text-[10.5px] font-medium truncate drop-shadow">
+                              Original Audio {origTrackMuted ? '(Muted)' : '(Linked)'}
+                            </span>
+                          </div>
+                          <button
+                            type="button"
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              if (
+                                isTrackLocked(projectRef.current, 'orig') ||
+                                isTrackLocked(projectRef.current, 'video')
+                              ) {
+                                onNotify?.(LOCKED_LAYER_MESSAGE);
+                                return;
+                              }
+                              patchProjectImmediate((cur) => {
+                                const res = unlinkVideoClipAudio(cur, undefined, uuidv4);
+                                return {
+                                  videoClips: res.videoClips,
+                                  originalAudioClips: res.originalAudioClips,
+                                };
+                              });
+                              onSelectElement?.({ kind: 'audio', track: 'orig' });
+                            }}
+                            className="relative z-10 px-1.5 py-0.5 rounded bg-zinc-950/75 hover:bg-zinc-950 border border-cyan-400/50 text-[10px] font-semibold text-cyan-200 flex items-center gap-1 shrink-0 cursor-pointer"
+                            title="Separate original audio onto independent 1.0x track"
+                          >
+                            <Unlink className="w-2.5 h-2.5" />
+                            Unlink
+                          </button>
+                          <ClipEndBoundaryMarker locked={origLocked} selected={isSel} endTime={linkedEnd} />
                         </div>
-                      )}
-                      <span className="relative z-10 text-[10.5px] font-medium truncate drop-shadow">
-                        Original Audio {origTrackMuted ? '(Muted)' : '(Linked)'}
-                      </span>
-                      <button
-                        type="button"
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          patchProjectImmediate((cur) => {
-                            const res = unlinkVideoClipAudio(cur, undefined, uuidv4);
-                            return {
-                              videoClips: res.videoClips,
-                              originalAudioClips: res.originalAudioClips,
-                            };
-                          });
-                          onSelectElement?.({ kind: 'audio', track: 'orig' });
-                        }}
-                        className="relative z-10 px-1.5 py-0.5 rounded bg-zinc-950/75 hover:bg-zinc-950 border border-cyan-400/50 text-[10px] font-semibold text-cyan-200 flex items-center gap-1 shrink-0 cursor-pointer"
-                        title="Separate original audio onto independent 1.0x track"
-                      >
-                        <Unlink className="w-2.5 h-2.5" />
-                        Unlink
-                      </button>
-                    </div>
+                      );
+                    })()
                   )
                 ) : (
                   <span className="px-2.5 h-full flex items-center text-[10.5px] text-zinc-600">
@@ -2479,12 +2739,16 @@ export function TimelineEditor({
                 {bgmClips.length > 0 ? (
                   bgmClips.map((bc, idx) => {
                     const bcEnd = getTimelineAudioClipEnd(bc);
-                    const left = (bc.timelineStart / duration) * 100;
-                    const width = Math.max(2.5, ((bcEnd - bc.timelineStart) / duration) * 100);
+                    const { left, width } = computeClipGeometry(
+                      bc.timelineStart,
+                      bcEnd,
+                      duration
+                    );
                     const isSel =
                       selectedElement?.kind === 'audio' &&
                       selectedElement.track === 'bgm' &&
                       (!selectedElement.clipId || selectedElement.clipId === bc.id);
+                    const isLocked = Boolean(project.voice.bgmLocked || bc.locked);
                     const isClipMuted = bgMusicMuted || Boolean(bc.muted);
                     const maxBgmSrc = Math.max(bc.sourceEnd, bc.sourceDuration ?? duration);
                     const bcPeaks = slicePeaksByRatio(
@@ -2506,6 +2770,7 @@ export function TimelineEditor({
                             origSourceStart: bc.sourceStart,
                             origSourceEnd: bc.sourceEnd,
                             maxSourceDuration: maxBgmSrc,
+                            locked: isLocked,
                           })
                         }
                         onClick={(e) => {
@@ -2513,39 +2778,48 @@ export function TimelineEditor({
                           if (suppressClickRef.current) return;
                           onSelectElement?.({ kind: 'audio', track: 'bgm', clipId: bc.id });
                         }}
-                        style={{ left: `${left}%`, width: `${width}%` }}
+                        style={{ left: `${left}%`, width: `${width}%`, minWidth: '4px' }}
                         title={`${bc.label || `Music ${idx + 1}`} (${bc.timelineStart.toFixed(
                           2
-                        )}s → ${bcEnd.toFixed(2)}s)`}
-                        className={`group absolute inset-y-0.5 rounded flex items-center justify-between text-[10px] font-medium overflow-hidden cursor-grab active:cursor-grabbing border touch-none ${
+                        )}s → ${bcEnd.toFixed(2)}s)${isLocked ? ' · Locked' : ''}`}
+                        className={`group absolute inset-y-0.5 rounded flex items-center justify-between text-[10px] font-medium overflow-hidden border touch-none ${
+                          isLocked ? 'cursor-pointer' : 'cursor-grab active:cursor-grabbing'
+                        } ${
                           isSel
-                            ? 'bg-indigo-600/90 border-white ring-1 ring-white/50 text-white z-10'
+                            ? isLocked
+                              ? 'bg-indigo-700/90 border-amber-400 ring-1 ring-amber-300/60 text-white z-10'
+                              : 'bg-indigo-600/90 border-white ring-1 ring-white/50 text-white z-10'
                             : isClipMuted
                             ? 'bg-zinc-900 border-zinc-700 text-zinc-500'
+                            : isLocked
+                            ? 'bg-indigo-800/70 border-amber-400/55 border-dashed text-white'
                             : 'bg-indigo-700/75 hover:bg-indigo-600/85 border-indigo-300/45 text-white'
                         }`}
                       >
-                        <div
-                          onPointerDown={(e) => {
-                            e.stopPropagation();
-                            startClipDrag(e, {
-                              kind: 'bgm-clip',
-                              id: bc.id,
-                              mode: 'trim-start',
-                              origStart: bc.timelineStart,
-                              origEnd: bcEnd,
-                              origSourceStart: bc.sourceStart,
-                              origSourceEnd: bc.sourceEnd,
-                              maxSourceDuration: maxBgmSrc,
-                            });
-                          }}
-                          className={`w-2.5 h-full bg-white cursor-ew-resize shrink-0 touch-none flex items-center justify-center z-20 transition-opacity ${
-                            isSel ? 'opacity-100' : 'opacity-0 group-hover:opacity-100'
-                          }`}
-                          title="Trim music start"
-                        >
-                          <div className="w-[2px] h-3 bg-zinc-800 rounded-full" />
-                        </div>
+                        {!isLocked && (
+                          <div
+                            onPointerDown={(e) => {
+                              e.stopPropagation();
+                              startClipDrag(e, {
+                                kind: 'bgm-clip',
+                                id: bc.id,
+                                mode: 'trim-start',
+                                origStart: bc.timelineStart,
+                                origEnd: bcEnd,
+                                origSourceStart: bc.sourceStart,
+                                origSourceEnd: bc.sourceEnd,
+                                maxSourceDuration: maxBgmSrc,
+                                locked: isLocked,
+                              });
+                            }}
+                            className={`w-2.5 h-full bg-white cursor-ew-resize shrink-0 touch-none flex items-center justify-center z-20 transition-opacity ${
+                              isSel ? 'opacity-100' : 'opacity-0 group-hover:opacity-100'
+                            }`}
+                            title="Trim music start"
+                          >
+                            <div className="w-[2px] h-3 bg-zinc-800 rounded-full" />
+                          </div>
+                        )}
 
                         <div className="relative flex-1 h-full flex items-center gap-1 px-1.5 overflow-hidden pointer-events-none">
                           {bcPeaks.length > 0 && (
@@ -2558,33 +2832,38 @@ export function TimelineEditor({
                               />
                             </div>
                           )}
+                          {isLocked && <Lock className="relative z-10 w-2.5 h-2.5 text-amber-300 shrink-0" />}
                           <Music className="relative z-10 w-3 h-3 shrink-0" />
                           <span className="relative z-10 truncate drop-shadow">
                             {bc.label || project.voice.bgMusicFilename || 'Background Music'}
                           </span>
                         </div>
 
-                        <div
-                          onPointerDown={(e) => {
-                            e.stopPropagation();
-                            startClipDrag(e, {
-                              kind: 'bgm-clip',
-                              id: bc.id,
-                              mode: 'trim-end',
-                              origStart: bc.timelineStart,
-                              origEnd: bcEnd,
-                              origSourceStart: bc.sourceStart,
-                              origSourceEnd: bc.sourceEnd,
-                              maxSourceDuration: maxBgmSrc,
-                            });
-                          }}
-                          className={`w-2.5 h-full bg-white cursor-ew-resize shrink-0 touch-none flex items-center justify-center z-20 transition-opacity ${
-                            isSel ? 'opacity-100' : 'opacity-0 group-hover:opacity-100'
-                          }`}
-                          title="Trim music end"
-                        >
-                          <div className="w-[2px] h-3 bg-zinc-800 rounded-full" />
-                        </div>
+                        {!isLocked && (
+                          <div
+                            onPointerDown={(e) => {
+                              e.stopPropagation();
+                              startClipDrag(e, {
+                                kind: 'bgm-clip',
+                                id: bc.id,
+                                mode: 'trim-end',
+                                origStart: bc.timelineStart,
+                                origEnd: bcEnd,
+                                origSourceStart: bc.sourceStart,
+                                origSourceEnd: bc.sourceEnd,
+                                maxSourceDuration: maxBgmSrc,
+                                locked: isLocked,
+                              });
+                            }}
+                            className={`w-2.5 h-full bg-white cursor-ew-resize shrink-0 touch-none flex items-center justify-center z-20 transition-opacity ${
+                              isSel ? 'opacity-100' : 'opacity-0 group-hover:opacity-100'
+                            }`}
+                            title="Trim music end"
+                          >
+                            <div className="w-[2px] h-3 bg-zinc-800 rounded-full" />
+                          </div>
+                        )}
+                        <ClipEndBoundaryMarker locked={isLocked} selected={isSel} endTime={bcEnd} />
                       </div>
                     );
                   })
@@ -2622,12 +2901,16 @@ export function TimelineEditor({
                 {sfxClips.length > 0 ? (
                   sfxClips.map((sc, idx) => {
                     const scEnd = getTimelineAudioClipEnd(sc);
-                    const left = (sc.timelineStart / duration) * 100;
-                    const width = Math.max(2.5, ((scEnd - sc.timelineStart) / duration) * 100);
+                    const { left, width } = computeClipGeometry(
+                      sc.timelineStart,
+                      scEnd,
+                      duration
+                    );
                     const isSel =
                       selectedElement?.kind === 'audio' &&
                       selectedElement.track === 'sfx' &&
                       (!selectedElement.clipId || selectedElement.clipId === sc.id);
+                    const isLocked = Boolean(project.voice.sfxLocked || sc.locked);
                     const isClipMuted = sfxMuted || Boolean(sc.muted);
                     const maxSfxSrc = Math.max(sc.sourceEnd, sc.sourceDuration ?? duration);
                     const scPeaks = slicePeaksByRatio(
@@ -2649,6 +2932,7 @@ export function TimelineEditor({
                             origSourceStart: sc.sourceStart,
                             origSourceEnd: sc.sourceEnd,
                             maxSourceDuration: maxSfxSrc,
+                            locked: isLocked,
                           })
                         }
                         onClick={(e) => {
@@ -2656,39 +2940,48 @@ export function TimelineEditor({
                           if (suppressClickRef.current) return;
                           onSelectElement?.({ kind: 'audio', track: 'sfx', clipId: sc.id });
                         }}
-                        style={{ left: `${left}%`, width: `${width}%` }}
+                        style={{ left: `${left}%`, width: `${width}%`, minWidth: '4px' }}
                         title={`${sc.label || `SFX ${idx + 1}`} (${sc.timelineStart.toFixed(
                           2
-                        )}s → ${scEnd.toFixed(2)}s)`}
-                        className={`group absolute inset-y-0.5 rounded flex items-center justify-between text-[10px] font-medium overflow-hidden cursor-grab active:cursor-grabbing border touch-none ${
+                        )}s → ${scEnd.toFixed(2)}s)${isLocked ? ' · Locked' : ''}`}
+                        className={`group absolute inset-y-0.5 rounded flex items-center justify-between text-[10px] font-medium overflow-hidden border touch-none ${
+                          isLocked ? 'cursor-pointer' : 'cursor-grab active:cursor-grabbing'
+                        } ${
                           isSel
-                            ? 'bg-emerald-600/90 border-white ring-1 ring-white/50 text-white z-10'
+                            ? isLocked
+                              ? 'bg-emerald-700/90 border-amber-400 ring-1 ring-amber-300/60 text-white z-10'
+                              : 'bg-emerald-600/90 border-white ring-1 ring-white/50 text-white z-10'
                             : isClipMuted
                             ? 'bg-zinc-900 border-zinc-700 text-zinc-500'
+                            : isLocked
+                            ? 'bg-emerald-800/70 border-amber-400/55 border-dashed text-white'
                             : 'bg-emerald-700/75 hover:bg-emerald-600/85 border-emerald-300/45 text-white'
                         }`}
                       >
-                        <div
-                          onPointerDown={(e) => {
-                            e.stopPropagation();
-                            startClipDrag(e, {
-                              kind: 'sfx-clip',
-                              id: sc.id,
-                              mode: 'trim-start',
-                              origStart: sc.timelineStart,
-                              origEnd: scEnd,
-                              origSourceStart: sc.sourceStart,
-                              origSourceEnd: sc.sourceEnd,
-                              maxSourceDuration: maxSfxSrc,
-                            });
-                          }}
-                          className={`w-2.5 h-full bg-white cursor-ew-resize shrink-0 touch-none flex items-center justify-center z-20 transition-opacity ${
-                            isSel ? 'opacity-100' : 'opacity-0 group-hover:opacity-100'
-                          }`}
-                          title="Trim SFX start"
-                        >
-                          <div className="w-[2px] h-3 bg-zinc-800 rounded-full" />
-                        </div>
+                        {!isLocked && (
+                          <div
+                            onPointerDown={(e) => {
+                              e.stopPropagation();
+                              startClipDrag(e, {
+                                kind: 'sfx-clip',
+                                id: sc.id,
+                                mode: 'trim-start',
+                                origStart: sc.timelineStart,
+                                origEnd: scEnd,
+                                origSourceStart: sc.sourceStart,
+                                origSourceEnd: sc.sourceEnd,
+                                maxSourceDuration: maxSfxSrc,
+                                locked: isLocked,
+                              });
+                            }}
+                            className={`w-2.5 h-full bg-white cursor-ew-resize shrink-0 touch-none flex items-center justify-center z-20 transition-opacity ${
+                              isSel ? 'opacity-100' : 'opacity-0 group-hover:opacity-100'
+                            }`}
+                            title="Trim SFX start"
+                          >
+                            <div className="w-[2px] h-3 bg-zinc-800 rounded-full" />
+                          </div>
+                        )}
 
                         <div className="relative flex-1 h-full flex items-center gap-1 px-1.5 overflow-hidden pointer-events-none">
                           {scPeaks.length > 0 && (
@@ -2701,33 +2994,38 @@ export function TimelineEditor({
                               />
                             </div>
                           )}
+                          {isLocked && <Lock className="relative z-10 w-2.5 h-2.5 text-amber-300 shrink-0" />}
                           <Zap className="relative z-10 w-3 h-3 shrink-0" />
                           <span className="relative z-10 truncate drop-shadow">
                             {sc.label || project.voice.sfxFilename || 'SFX Track'}
                           </span>
                         </div>
 
-                        <div
-                          onPointerDown={(e) => {
-                            e.stopPropagation();
-                            startClipDrag(e, {
-                              kind: 'sfx-clip',
-                              id: sc.id,
-                              mode: 'trim-end',
-                              origStart: sc.timelineStart,
-                              origEnd: scEnd,
-                              origSourceStart: sc.sourceStart,
-                              origSourceEnd: sc.sourceEnd,
-                              maxSourceDuration: maxSfxSrc,
-                            });
-                          }}
-                          className={`w-2.5 h-full bg-white cursor-ew-resize shrink-0 touch-none flex items-center justify-center z-20 transition-opacity ${
-                            isSel ? 'opacity-100' : 'opacity-0 group-hover:opacity-100'
-                          }`}
-                          title="Trim SFX end"
-                        >
-                          <div className="w-[2px] h-3 bg-zinc-800 rounded-full" />
-                        </div>
+                        {!isLocked && (
+                          <div
+                            onPointerDown={(e) => {
+                              e.stopPropagation();
+                              startClipDrag(e, {
+                                kind: 'sfx-clip',
+                                id: sc.id,
+                                mode: 'trim-end',
+                                origStart: sc.timelineStart,
+                                origEnd: scEnd,
+                                origSourceStart: sc.sourceStart,
+                                origSourceEnd: sc.sourceEnd,
+                                maxSourceDuration: maxSfxSrc,
+                                locked: isLocked,
+                              });
+                            }}
+                            className={`w-2.5 h-full bg-white cursor-ew-resize shrink-0 touch-none flex items-center justify-center z-20 transition-opacity ${
+                              isSel ? 'opacity-100' : 'opacity-0 group-hover:opacity-100'
+                            }`}
+                            title="Trim SFX end"
+                          >
+                            <div className="w-[2px] h-3 bg-zinc-800 rounded-full" />
+                          </div>
+                        )}
+                        <ClipEndBoundaryMarker locked={isLocked} selected={isSel} endTime={scEnd} />
                       </div>
                     );
                   })
@@ -2765,20 +3063,20 @@ export function TimelineEditor({
                 {project.logos.map((logo) => {
                   const start = logo.permanent ? 0 : logo.startTime;
                   const end = logo.permanent ? duration : logo.endTime;
-                  const left = (start / duration) * 100;
-                  const width = Math.max(3, ((end - start) / duration) * 100);
+                  const { left, width } = computeClipGeometry(start, end, duration);
                   const isSel = selectedElement?.kind === 'logo' && selectedElement.id === logo.id;
+                  const isLocked = Boolean(logo.locked);
                   return (
                     <div
                       key={logo.id}
                       onPointerDown={(e) =>
-                        !logo.locked &&
                         startClipDrag(e, {
                           kind: 'logo',
                           id: logo.id,
                           mode: 'move',
                           origStart: start,
                           origEnd: end,
+                          locked: isLocked,
                         })
                       }
                       onClick={(e) => {
@@ -2786,16 +3084,23 @@ export function TimelineEditor({
                         if (suppressClickRef.current) return;
                         onSelectElement?.({ kind: 'logo', id: logo.id });
                       }}
-                      className={`absolute inset-y-0.5 rounded flex items-center justify-between text-[10.5px] font-medium overflow-hidden cursor-grab active:cursor-grabbing border touch-none ${
+                      title={`${logo.filename} (${start.toFixed(2)}s → ${end.toFixed(2)}s)${isLocked ? ' · Locked' : ''}`}
+                      className={`absolute inset-y-0.5 rounded flex items-center justify-between text-[10.5px] font-medium overflow-hidden border touch-none ${
+                        isLocked ? 'cursor-pointer' : 'cursor-grab active:cursor-grabbing'
+                      } ${
                         isSel
-                          ? 'bg-violet-600 border-white ring-1 ring-white/50 text-white z-10'
+                          ? isLocked
+                            ? 'bg-violet-700 border-amber-400 ring-1 ring-amber-300/60 text-white z-10'
+                            : 'bg-violet-600 border-white ring-1 ring-white/50 text-white z-10'
                           : logo.enabled
-                          ? 'bg-violet-600/80 border-violet-300/45 text-white hover:bg-violet-600'
+                          ? isLocked
+                            ? 'bg-violet-700/75 border-amber-400/55 border-dashed text-white'
+                            : 'bg-violet-600/80 border-violet-300/45 text-white hover:bg-violet-600'
                           : 'bg-zinc-800 border-zinc-700 text-zinc-400'
                       }`}
-                      style={{ left: `${left}%`, width: `${width}%` }}
+                      style={{ left: `${left}%`, width: `${width}%`, minWidth: '4px' }}
                     >
-                      {isSel && !logo.locked && (
+                      {isSel && !isLocked && (
                         <div
                           onPointerDown={(e) =>
                             startClipDrag(e, {
@@ -2804,6 +3109,7 @@ export function TimelineEditor({
                               mode: 'trim-start',
                               origStart: start,
                               origEnd: end,
+                              locked: isLocked,
                             })
                           }
                           className="w-2.5 h-full bg-white hover:bg-violet-100 cursor-ew-resize shrink-0 touch-none flex items-center justify-center z-20"
@@ -2812,11 +3118,12 @@ export function TimelineEditor({
                           <div className="w-[2px] h-3 bg-zinc-800 rounded-full" />
                         </div>
                       )}
-                      <div className="flex items-center gap-1.5 px-1.5 min-w-0 flex-1 truncate pointer-events-none">
+                      <div className="flex items-center gap-1 px-1.5 min-w-0 flex-1 truncate pointer-events-none">
+                        {isLocked && <Lock className="w-2.5 h-2.5 text-amber-300 shrink-0" />}
                         <Layers className="w-3 h-3 shrink-0" />
                         <span className="truncate">{logo.filename}</span>
                       </div>
-                      {isSel && !logo.locked && (
+                      {isSel && !isLocked && (
                         <div
                           onPointerDown={(e) =>
                             startClipDrag(e, {
@@ -2825,6 +3132,7 @@ export function TimelineEditor({
                               mode: 'trim-end',
                               origStart: start,
                               origEnd: end,
+                              locked: isLocked,
                             })
                           }
                           className="w-2.5 h-full bg-white hover:bg-violet-100 cursor-ew-resize shrink-0 touch-none flex items-center justify-center z-20"
@@ -2833,6 +3141,7 @@ export function TimelineEditor({
                           <div className="w-[2px] h-3 bg-zinc-800 rounded-full" />
                         </div>
                       )}
+                      <ClipEndBoundaryMarker locked={isLocked} selected={isSel} endTime={end} />
                     </div>
                   );
                 })}
@@ -2840,21 +3149,21 @@ export function TimelineEditor({
                 {(project.subtitleStyle.extraElements || []).map((el) => {
                   const start = el.startTime || 0;
                   const end = el.endTime > start ? el.endTime : duration;
-                  const left = (start / duration) * 100;
-                  const width = Math.max(3, ((end - start) / duration) * 100);
+                  const { left, width } = computeClipGeometry(start, end, duration);
                   const isSel =
                     selectedElement?.kind === 'caption-element' && selectedElement.id === el.id;
+                  const isLocked = Boolean(el.locked);
                   return (
                     <div
                       key={el.id}
                       onPointerDown={(e) =>
-                        !el.locked &&
                         startClipDrag(e, {
                           kind: 'caption-element',
                           id: el.id,
                           mode: 'move',
                           origStart: start,
                           origEnd: end,
+                          locked: isLocked,
                         })
                       }
                       onClick={(e) => {
@@ -2862,16 +3171,23 @@ export function TimelineEditor({
                         if (suppressClickRef.current) return;
                         onSelectElement?.({ kind: 'caption-element', id: el.id });
                       }}
-                      className={`absolute inset-y-0.5 rounded flex items-center justify-between text-[10.5px] font-medium overflow-hidden cursor-grab active:cursor-grabbing border touch-none ${
+                      title={`${el.text || el.label} (${start.toFixed(2)}s → ${end.toFixed(2)}s)${isLocked ? ' · Locked' : ''}`}
+                      className={`absolute inset-y-0.5 rounded flex items-center justify-between text-[10.5px] font-medium overflow-hidden border touch-none ${
+                        isLocked ? 'cursor-pointer' : 'cursor-grab active:cursor-grabbing'
+                      } ${
                         isSel
-                          ? 'bg-fuchsia-600 border-white ring-1 ring-white/50 text-white z-10'
+                          ? isLocked
+                            ? 'bg-fuchsia-700 border-amber-400 ring-1 ring-amber-300/60 text-white z-10'
+                            : 'bg-fuchsia-600 border-white ring-1 ring-white/50 text-white z-10'
                           : el.visible
-                          ? 'bg-purple-600/80 border-purple-300/45 text-white hover:bg-purple-600'
+                          ? isLocked
+                            ? 'bg-purple-700/75 border-amber-400/55 border-dashed text-white'
+                            : 'bg-purple-600/80 border-purple-300/45 text-white hover:bg-purple-600'
                           : 'bg-zinc-800 border-zinc-700 text-zinc-400'
                       }`}
-                      style={{ left: `${left}%`, width: `${width}%` }}
+                      style={{ left: `${left}%`, width: `${width}%`, minWidth: '4px' }}
                     >
-                      {isSel && !el.locked && (
+                      {isSel && !isLocked && (
                         <div
                           onPointerDown={(e) =>
                             startClipDrag(e, {
@@ -2880,6 +3196,7 @@ export function TimelineEditor({
                               mode: 'trim-start',
                               origStart: start,
                               origEnd: end,
+                              locked: isLocked,
                             })
                           }
                           className="w-2.5 h-full bg-white cursor-ew-resize shrink-0 touch-none flex items-center justify-center z-20"
@@ -2889,10 +3206,11 @@ export function TimelineEditor({
                         </div>
                       )}
                       <div className="flex items-center gap-1 px-1.5 min-w-0 flex-1 truncate pointer-events-none">
+                        {isLocked && <Lock className="w-2.5 h-2.5 text-amber-300 shrink-0" />}
                         <Type className="w-3 h-3 shrink-0" />
                         <span className="truncate">{el.text || el.label}</span>
                       </div>
-                      {isSel && !el.locked && (
+                      {isSel && !isLocked && (
                         <div
                           onPointerDown={(e) =>
                             startClipDrag(e, {
@@ -2901,6 +3219,7 @@ export function TimelineEditor({
                               mode: 'trim-end',
                               origStart: start,
                               origEnd: end,
+                              locked: isLocked,
                             })
                           }
                           className="w-2.5 h-full bg-white cursor-ew-resize shrink-0 touch-none flex items-center justify-center z-20"
@@ -2909,6 +3228,7 @@ export function TimelineEditor({
                           <div className="w-[2px] h-3 bg-zinc-800 rounded-full" />
                         </div>
                       )}
+                      <ClipEndBoundaryMarker locked={isLocked} selected={isSel} endTime={end} />
                     </div>
                   );
                 })}
@@ -2957,48 +3277,54 @@ export function TimelineEditor({
                     syncedEnd: c.syncedEnd,
                   })));
                   const isSel = selectedElement?.kind === 'blur' && selectedElement.id === blur.id;
+                  const isLocked = Boolean(blur.locked);
 
                   // Render each active interval for multi-interval linked masks, or single editable block
                   const blocks = intervals.length > 0 ? intervals : [{ start: span.startTime, end: span.endTime }];
                   return blocks.map((iv, ivIdx) => {
-                    const left = (iv.start / duration) * 100;
-                    const width = Math.max(2.2, ((iv.end - iv.start) / duration) * 100);
+                    const { left, width } = computeClipGeometry(iv.start, iv.end, duration);
                     return (
                       <div
                         key={`${blur.id}_${ivIdx}`}
-                        onPointerDown={(e) => {
-                          if (blur.locked) return;
+                        onPointerDown={(e) =>
                           startClipDrag(e, {
                             kind: 'blur',
                             id: blur.id,
                             mode: 'move',
                             origStart: iv.start,
                             origEnd: iv.end,
-                          });
-                        }}
+                            locked: isLocked,
+                          })
+                        }
                         onClick={(e) => {
                           e.stopPropagation();
                           if (suppressClickRef.current) return;
                           onSeek(iv.start);
                           onSelectElement?.({ kind: 'blur', id: blur.id });
                         }}
-                        title={
+                        title={`${
                           isLinked
                             ? `${blur.name} (Linked to ${blur.subtitleLink?.mode} captions · ${iv.start.toFixed(2)}s–${iv.end.toFixed(2)}s)`
                             : `${blur.name} (${iv.start.toFixed(2)}s–${iv.end.toFixed(2)}s)`
-                        }
-                        className={`absolute inset-y-0.5 rounded flex items-center justify-between text-[10.5px] font-medium overflow-hidden cursor-grab active:cursor-grabbing border touch-none ${
+                        }${isLocked ? ' · Locked' : ''}`}
+                        className={`absolute inset-y-0.5 rounded flex items-center justify-between text-[10.5px] font-medium overflow-hidden border touch-none ${
+                          isLocked ? 'cursor-pointer' : 'cursor-grab active:cursor-grabbing'
+                        } ${
                           isSel
-                            ? 'bg-sky-600 border-white ring-1 ring-white/50 text-white z-10'
+                            ? isLocked
+                              ? 'bg-sky-700 border-amber-400 ring-1 ring-amber-300/60 text-white z-10'
+                              : 'bg-sky-600 border-white ring-1 ring-white/50 text-white z-10'
                             : blur.enabled
-                            ? blur.isSubtitleMask
+                            ? isLocked
+                              ? 'bg-sky-800/75 border-amber-400/55 border-dashed text-white'
+                              : blur.isSubtitleMask
                               ? 'bg-cyan-700/80 hover:bg-cyan-600/85 border-cyan-300/50 text-white'
                               : 'bg-sky-700/80 hover:bg-sky-600/85 border-sky-300/45 text-white'
                             : 'bg-zinc-800 border-zinc-700 text-zinc-400'
                         }`}
-                        style={{ left: `${left}%`, width: `${width}%` }}
+                        style={{ left: `${left}%`, width: `${width}%`, minWidth: '4px' }}
                       >
-                        {isSel && !blur.locked && blocks.length === 1 && (
+                        {isSel && !isLocked && blocks.length === 1 && (
                           <div
                             onPointerDown={(e) =>
                               startClipDrag(e, {
@@ -3007,6 +3333,7 @@ export function TimelineEditor({
                                 mode: 'trim-start',
                                 origStart: iv.start,
                                 origEnd: iv.end,
+                                locked: isLocked,
                               })
                             }
                             className="w-2.5 h-full bg-white cursor-ew-resize shrink-0 touch-none flex items-center justify-center z-20"
@@ -3016,6 +3343,7 @@ export function TimelineEditor({
                           </div>
                         )}
                         <div className="flex items-center gap-1 px-1.5 min-w-0 flex-1 truncate pointer-events-none">
+                          {isLocked && <Lock className="w-2.5 h-2.5 text-amber-300 shrink-0" />}
                           <Droplet className="w-3 h-3 shrink-0" />
                           <span className="truncate">{blur.name}</span>
                           {isLinked && (
@@ -3024,7 +3352,7 @@ export function TimelineEditor({
                             </span>
                           )}
                         </div>
-                        {isSel && !blur.locked && blocks.length === 1 && (
+                        {isSel && !isLocked && blocks.length === 1 && (
                           <div
                             onPointerDown={(e) =>
                               startClipDrag(e, {
@@ -3033,6 +3361,7 @@ export function TimelineEditor({
                                 mode: 'trim-end',
                                 origStart: iv.start,
                                 origEnd: iv.end,
+                                locked: isLocked,
                               })
                             }
                             className="w-2.5 h-full bg-white cursor-ew-resize shrink-0 touch-none flex items-center justify-center z-20"
@@ -3041,6 +3370,7 @@ export function TimelineEditor({
                             <div className="w-[2px] h-3 bg-zinc-800 rounded-full" />
                           </div>
                         )}
+                        <ClipEndBoundaryMarker locked={isLocked} selected={isSel} endTime={iv.end} />
                       </div>
                     );
                   });
@@ -3076,41 +3406,47 @@ export function TimelineEditor({
                 {filterStack.map((fl) => {
                   const start = Math.max(0, fl.startTime || 0);
                   const end = fl.endTime > start ? fl.endTime : duration;
-                  const left = (start / duration) * 100;
-                  const width = Math.max(3, ((end - start) / duration) * 100);
+                  const { left, width } = computeClipGeometry(start, end, duration);
                   const isSel =
                     selectedElement?.kind === 'filter' && selectedElement.filterId === fl.id;
+                  const isLocked = Boolean(fl.locked);
                   const meta = getFilterPresetMeta(fl.preset);
 
                   return (
                     <div
                       key={fl.id}
-                      onPointerDown={(e) => {
-                        if (fl.locked) return;
+                      onPointerDown={(e) =>
                         startClipDrag(e, {
                           kind: 'filter-item',
                           id: fl.id,
                           mode: 'move',
                           origStart: start,
                           origEnd: end,
-                        });
-                      }}
+                          locked: isLocked,
+                        })
+                      }
                       onClick={(e) => {
                         e.stopPropagation();
                         if (suppressClickRef.current) return;
                         onSelectElement?.({ kind: 'filter', filterId: fl.id });
                       }}
-                      className={`absolute inset-y-0.5 rounded flex items-center justify-between text-[10.5px] font-medium overflow-hidden cursor-grab active:cursor-grabbing border touch-none ${
+                      className={`absolute inset-y-0.5 rounded flex items-center justify-between text-[10.5px] font-medium overflow-hidden border touch-none ${
+                        isLocked ? 'cursor-pointer' : 'cursor-grab active:cursor-grabbing'
+                      } ${
                         isSel
-                          ? 'bg-pink-600 border-white ring-1 ring-white/50 text-white z-10'
+                          ? isLocked
+                            ? 'bg-pink-700 border-amber-400 ring-1 ring-amber-300/60 text-white z-10'
+                            : 'bg-pink-600 border-white ring-1 ring-white/50 text-white z-10'
                           : fl.enabled
-                          ? 'bg-pink-700/80 hover:bg-pink-600/85 border-pink-300/45 text-white'
+                          ? isLocked
+                            ? 'bg-pink-800/75 border-amber-400/55 border-dashed text-white'
+                            : 'bg-pink-700/80 hover:bg-pink-600/85 border-pink-300/45 text-white'
                           : 'bg-zinc-800/80 border-zinc-700 text-zinc-400 opacity-65'
                       }`}
-                      style={{ left: `${left}%`, width: `${width}%` }}
-                      title={`${fl.name || meta.label} (${fl.intensity}%) · ${start.toFixed(1)}s → ${end.toFixed(1)}s`}
+                      style={{ left: `${left}%`, width: `${width}%`, minWidth: '4px' }}
+                      title={`${fl.name || meta.label} (${fl.intensity}%) · ${start.toFixed(1)}s → ${end.toFixed(1)}s${isLocked ? ' · Locked' : ''}`}
                     >
-                      {isSel && !fl.locked && (
+                      {isSel && !isLocked && (
                         <div
                           onPointerDown={(e) =>
                             startClipDrag(e, {
@@ -3119,6 +3455,7 @@ export function TimelineEditor({
                               mode: 'trim-start',
                               origStart: start,
                               origEnd: end,
+                              locked: isLocked,
                             })
                           }
                           className="w-2.5 h-full bg-white cursor-ew-resize shrink-0 touch-none flex items-center justify-center z-20"
@@ -3128,12 +3465,13 @@ export function TimelineEditor({
                         </div>
                       )}
                       <div className="flex items-center gap-1 px-1.5 min-w-0 flex-1 truncate pointer-events-none">
+                        {isLocked && <Lock className="w-2.5 h-2.5 text-amber-300 shrink-0" />}
                         <Wand2 className="w-3 h-3 shrink-0" />
                         <span className="truncate">
                           {fl.name || meta.label} ({fl.intensity}%)
                         </span>
                       </div>
-                      {isSel && !fl.locked && (
+                      {isSel && !isLocked && (
                         <div
                           onPointerDown={(e) =>
                             startClipDrag(e, {
@@ -3142,6 +3480,7 @@ export function TimelineEditor({
                               mode: 'trim-end',
                               origStart: start,
                               origEnd: end,
+                              locked: isLocked,
                             })
                           }
                           className="w-2.5 h-full bg-white cursor-ew-resize shrink-0 touch-none flex items-center justify-center z-20"
@@ -3150,29 +3489,49 @@ export function TimelineEditor({
                           <div className="w-[2px] h-3 bg-zinc-800 rounded-full" />
                         </div>
                       )}
+                      <ClipEndBoundaryMarker locked={isLocked} selected={isSel} endTime={end} />
                     </div>
                   );
                 })}
 
                 {filterStack.length === 0 && fxConfig.filterPreset !== 'none' && (
-                  <div
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      onSelectElement?.({ kind: 'filter' });
-                      openTool('filters');
-                    }}
-                    className={`absolute inset-y-0.5 left-0 right-0 rounded px-2 flex items-center gap-1.5 border text-[10.5px] font-medium ${
-                      selectedElement?.kind === 'filter'
-                        ? 'bg-pink-600/80 border-white text-white'
-                        : 'bg-pink-900/50 border-pink-400/40 text-pink-100'
-                    }`}
-                  >
-                    <Wand2 className="w-3 h-3 shrink-0" />
-                    <span className="truncate">
-                      Global Filter: {getFilterPresetMeta(fxConfig.filterPreset).label} (
-                      {fxConfig.filterIntensity ?? 100}%)
-                    </span>
-                  </div>
+                  (() => {
+                    const gfEnd =
+                      videoClips.length > 0 ? getVideoTimelineTotalDuration(videoClips) : srcDuration;
+                    const { left, width } = computeClipGeometry(0, gfEnd, duration);
+                    const gfLocked = Boolean(fxConfig.globalFilterLocked);
+                    const isSel = selectedElement?.kind === 'filter' && !selectedElement.filterId;
+                    return (
+                      <div
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          onSelectElement?.({ kind: 'filter' });
+                          openTool('filters');
+                        }}
+                        style={{ left: `${left}%`, width: `${width}%`, minWidth: '4px' }}
+                        title={`Global Filter: ${getFilterPresetMeta(fxConfig.filterPreset).label} (0.00s → ${gfEnd.toFixed(
+                          2
+                        )}s)${gfLocked ? ' · Locked' : ''}`}
+                        className={`absolute inset-y-0.5 rounded px-2 flex items-center gap-1.5 border text-[10.5px] font-medium overflow-hidden ${
+                          isSel
+                            ? gfLocked
+                              ? 'bg-pink-700/85 border-amber-400 text-white'
+                              : 'bg-pink-600/80 border-white text-white'
+                            : gfLocked
+                            ? 'bg-pink-900/50 border-amber-400/55 border-dashed text-pink-100'
+                            : 'bg-pink-900/50 border-pink-400/40 text-pink-100'
+                        }`}
+                      >
+                        {gfLocked && <Lock className="w-2.5 h-2.5 text-amber-300 shrink-0" />}
+                        <Wand2 className="w-3 h-3 shrink-0" />
+                        <span className="truncate">
+                          Global Filter: {getFilterPresetMeta(fxConfig.filterPreset).label} (
+                          {fxConfig.filterIntensity ?? 100}%)
+                        </span>
+                        <ClipEndBoundaryMarker locked={gfLocked} selected={isSel} endTime={gfEnd} />
+                      </div>
+                    );
+                  })()
                 )}
 
                 {filterStack.length === 0 && fxConfig.filterPreset === 'none' && (
@@ -3206,41 +3565,47 @@ export function TimelineEditor({
                 {allVisualEffects.map((fx) => {
                   const start = Math.max(0, fx.startTime || 0);
                   const end = fx.endTime > start ? fx.endTime : duration;
-                  const left = (start / duration) * 100;
-                  const width = Math.max(3, ((end - start) / duration) * 100);
+                  const { left, width } = computeClipGeometry(start, end, duration);
                   const isSel =
                     selectedElement?.kind === 'effect' && selectedElement.effectId === fx.id;
+                  const isLocked = Boolean(fx.locked);
                   const cat = getEffectCatalogEntry(fx.type);
 
                   return (
                     <div
                       key={fx.id}
-                      onPointerDown={(e) => {
-                        if (fx.locked) return;
+                      onPointerDown={(e) =>
                         startClipDrag(e, {
                           kind: 'effect-item',
                           id: fx.id,
                           mode: 'move',
                           origStart: start,
                           origEnd: end,
-                        });
-                      }}
+                          locked: isLocked,
+                        })
+                      }
                       onClick={(e) => {
                         e.stopPropagation();
                         if (suppressClickRef.current) return;
                         onSelectElement?.({ kind: 'effect', effectId: fx.id });
                       }}
-                      className={`absolute inset-y-0.5 rounded flex items-center justify-between text-[10.5px] font-medium overflow-hidden cursor-grab active:cursor-grabbing border touch-none ${
+                      className={`absolute inset-y-0.5 rounded flex items-center justify-between text-[10.5px] font-medium overflow-hidden border touch-none ${
+                        isLocked ? 'cursor-pointer' : 'cursor-grab active:cursor-grabbing'
+                      } ${
                         isSel
-                          ? 'bg-fuchsia-600 border-white ring-1 ring-white/50 text-white z-10'
+                          ? isLocked
+                            ? 'bg-fuchsia-700 border-amber-400 ring-1 ring-amber-300/60 text-white z-10'
+                            : 'bg-fuchsia-600 border-white ring-1 ring-white/50 text-white z-10'
                           : fx.enabled
-                          ? 'bg-fuchsia-700/80 hover:bg-fuchsia-600/85 border-fuchsia-300/45 text-white'
+                          ? isLocked
+                            ? 'bg-fuchsia-800/75 border-amber-400/55 border-dashed text-white'
+                            : 'bg-fuchsia-700/80 hover:bg-fuchsia-600/85 border-fuchsia-300/45 text-white'
                           : 'bg-zinc-800/80 border-zinc-700 text-zinc-400 opacity-65'
                       }`}
-                      style={{ left: `${left}%`, width: `${width}%` }}
-                      title={`${fx.name || cat.label} (${fx.intensity}%) · ${start.toFixed(1)}s → ${end.toFixed(1)}s`}
+                      style={{ left: `${left}%`, width: `${width}%`, minWidth: '4px' }}
+                      title={`${fx.name || cat.label} (${fx.intensity}%) · ${start.toFixed(1)}s → ${end.toFixed(1)}s${isLocked ? ' · Locked' : ''}`}
                     >
-                      {isSel && !fx.locked && (
+                      {isSel && !isLocked && (
                         <div
                           onPointerDown={(e) =>
                             startClipDrag(e, {
@@ -3249,6 +3614,7 @@ export function TimelineEditor({
                               mode: 'trim-start',
                               origStart: start,
                               origEnd: end,
+                              locked: isLocked,
                             })
                           }
                           className="w-2.5 h-full bg-white cursor-ew-resize shrink-0 touch-none flex items-center justify-center z-20"
@@ -3258,12 +3624,13 @@ export function TimelineEditor({
                         </div>
                       )}
                       <div className="flex items-center gap-1 px-1.5 min-w-0 flex-1 truncate pointer-events-none">
+                        {isLocked && <Lock className="w-2.5 h-2.5 text-amber-300 shrink-0" />}
                         <Sparkles className="w-3 h-3 shrink-0" />
                         <span className="truncate">
                           {fx.name || cat.label} ({fx.intensity}%)
                         </span>
                       </div>
-                      {isSel && !fx.locked && (
+                      {isSel && !isLocked && (
                         <div
                           onPointerDown={(e) =>
                             startClipDrag(e, {
@@ -3272,6 +3639,7 @@ export function TimelineEditor({
                               mode: 'trim-end',
                               origStart: start,
                               origEnd: end,
+                              locked: isLocked,
                             })
                           }
                           className="w-2.5 h-full bg-white cursor-ew-resize shrink-0 touch-none flex items-center justify-center z-20"
@@ -3280,6 +3648,7 @@ export function TimelineEditor({
                           <div className="w-[2px] h-3 bg-zinc-800 rounded-full" />
                         </div>
                       )}
+                      <ClipEndBoundaryMarker locked={isLocked} selected={isSel} endTime={end} />
                     </div>
                   );
                 })}
@@ -3368,9 +3737,40 @@ function MobileTrackMicroBadge({
   );
 }
 
+function ClipEndBoundaryMarker({
+  locked,
+  selected,
+  endTime,
+}: {
+  locked?: boolean;
+  selected?: boolean;
+  endTime: number;
+}) {
+  return (
+    <div
+      data-testid="clip-end-marker"
+      data-end-time={endTime.toFixed(2)}
+      aria-hidden="true"
+      className="pointer-events-none absolute right-0 top-0 bottom-0 z-10 flex flex-col justify-between items-end"
+    >
+      <div
+        className={`w-[3px] h-full shadow-[-1px_0_3px_rgba(0,0,0,0.65)] ${
+          locked
+            ? 'bg-amber-300/95'
+            : selected
+            ? 'bg-white'
+            : 'bg-white/85'
+        }`}
+      />
+    </div>
+  );
+}
+
 function TrackHeader({
   heightPx,
   active,
+  locked = false,
+  onToggleLock,
   accentClass,
   icon,
   label,
@@ -3379,6 +3779,8 @@ function TrackHeader({
 }: {
   heightPx: number;
   active: boolean;
+  locked?: boolean;
+  onToggleLock?: () => void;
   accentClass: string;
   icon: React.ReactNode;
   label: string;
@@ -3388,9 +3790,13 @@ function TrackHeader({
   return (
     <div
       style={{ height: `${heightPx}px` }}
-      className={`px-1.5 rounded-md border border-l-2 ${accentClass} flex items-center justify-between gap-1 transition-colors ${
+      className={`px-1.5 rounded-md border border-l-2 ${accentClass} flex items-center justify-between gap-0.5 transition-colors ${
         active
-          ? 'bg-[#22222E] border-white/25'
+          ? locked
+            ? 'bg-amber-950/35 border-amber-400/55'
+            : 'bg-[#22222E] border-white/25'
+          : locked
+          ? 'bg-amber-950/20 border-amber-500/35 hover:border-amber-400/55'
           : 'bg-[#17171F] border-white/[0.06] hover:border-white/[0.14]'
       }`}
     >
@@ -3402,6 +3808,25 @@ function TrackHeader({
         {icon}
         <span className="whitespace-nowrap truncate">{label}</span>
       </button>
+      {onToggleLock && (
+        <button
+          type="button"
+          onClick={(e) => {
+            e.stopPropagation();
+            onToggleLock();
+          }}
+          className={`w-6 h-6 rounded flex items-center justify-center cursor-pointer shrink-0 transition-colors ${
+            locked
+              ? 'bg-amber-500/20 text-amber-300 hover:bg-amber-500/30'
+              : 'text-zinc-500 hover:text-zinc-200 hover:bg-white/[0.08]'
+          }`}
+          title={locked ? `Unlock ${label}` : `Lock ${label}`}
+          aria-label={locked ? `Unlock ${label}` : `Lock ${label}`}
+          aria-pressed={locked}
+        >
+          {locked ? <Lock className="w-3 h-3" /> : <Unlock className="w-3 h-3" />}
+        </button>
+      )}
       {actionButton}
     </div>
   );
