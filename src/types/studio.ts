@@ -1075,10 +1075,13 @@ export const DEFAULT_VIDEO_EFFECTS: VideoEffectsConfig = {
   recentEffects: [],
 };
 
+export type ExportSpeedProfile = 'fast' | 'balanced' | 'high-quality';
+
 export interface ExportSettings {
   aspectRatio: 'original' | '16:9' | '9:16' | '1:1' | '4:5' | '3:4' | 'custom';
   resolution: '480p' | '720p' | '1080p';
   fitMode: 'crop' | 'blur-pad' | 'letterbox';
+  speedProfile?: ExportSpeedProfile;
   format: 'mp4';
   videoCodec: 'h264';
   audioCodec: 'aac';
@@ -1404,6 +1407,7 @@ export const DEFAULT_EXPORT_SETTINGS: ExportSettings = {
   aspectRatio: 'original',
   resolution: '1080p',
   fitMode: 'crop',
+  speedProfile: 'balanced',
   format: 'mp4',
   videoCodec: 'h264',
   audioCodec: 'aac',

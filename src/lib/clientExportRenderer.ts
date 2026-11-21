@@ -49,9 +49,7 @@ import {
   computeExportTargetFps,
   EXPORT_AUDIO_BITRATE_KBPS,
   EXPORT_AUDIO_SAMPLE_RATE,
-  EXPORT_H264_CRF,
-  EXPORT_VIDEO_BUFSIZE_KBPS,
-  EXPORT_VIDEO_MAXRATE_KBPS,
+  resolveExportSpeedPreset,
 } from './exportEstimation';
 import { idbList, idbListRawEntries, retrieveProjectVideoBlob } from './browserStorage';
 
@@ -2033,6 +2031,7 @@ export async function renderProjectExportInBrowser(params: {
         filterSteps.length = 0;
       }
 
+      const speedPreset = resolveExportSpeedPreset(exportSettings.speedProfile);
       const multiThreaded = isBrowserFFmpegMultiThreaded();
       const args: string[] = ['-i', srcMem, ...extraInputs];
 
@@ -2075,13 +2074,13 @@ export async function renderProjectExportInBrowser(params: {
           '-c:v', 'libx264',
           '-profile:v', 'main',
           '-level', '4.0',
-          '-preset', 'veryfast',
-          '-crf', String(EXPORT_H264_CRF),
-          '-maxrate', `${EXPORT_VIDEO_MAXRATE_KBPS}k`,
-          '-bufsize', `${EXPORT_VIDEO_BUFSIZE_KBPS}k`,
+          '-preset', speedPreset.ffmpegPreset,
+          '-crf', String(speedPreset.crf),
+          '-maxrate', `${speedPreset.videoMaxrateKbps}k`,
+          '-bufsize', `${speedPreset.videoBufsizeKbps}k`,
           '-g', String(Math.max(30, targetFps * 2)),
           '-keyint_min', String(targetFps),
-          '-sc_threshold', '40',
+          '-sc_threshold', String(speedPreset.scThreshold),
           '-pix_fmt', 'yuv420p',
           '-movflags', '+faststart',
           outFilename
@@ -2091,8 +2090,8 @@ export async function renderProjectExportInBrowser(params: {
       const stageLabel = canStreamCopyVideo
         ? 'Encoding (Smart stream copy)'
         : multiThreaded
-        ? 'Encoding (Multi-thread WASM)'
-        : 'Encoding';
+        ? `Encoding (${speedPreset.label} · Multi-thread WASM)`
+        : `Encoding (${speedPreset.label})`;
       onProgress(20, stageLabel, null);
 
       const startedAt = Date.now();
@@ -2129,7 +2128,7 @@ export async function renderProjectExportInBrowser(params: {
         onProgress(96, 'Finalizing MP4', null);
         const expectsAudio = Boolean(audioRes.audioMapLabel);
         const outInspection = await inspectMemfsMedia(ff, outFilename, {
-          measureAudioVolume: expectsAudio,
+          measureAudioVolume: false,
         });
 
         if (!outInspection.hasVideo) {

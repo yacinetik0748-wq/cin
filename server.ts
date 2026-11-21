@@ -166,6 +166,11 @@ app.use((req, res, next) => {
   );
   res.header('Access-Control-Allow-Credentials', 'true');
 
+  if (!req.path.startsWith('/api') && !req.path.startsWith('/media') && !req.path.startsWith('/storage')) {
+    res.header('Cross-Origin-Opener-Policy', 'same-origin');
+    res.header('Cross-Origin-Embedder-Policy', 'credentialless');
+  }
+
   if (req.method === 'OPTIONS') {
     res.sendStatus(204);
     return;

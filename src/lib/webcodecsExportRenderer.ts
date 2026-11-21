@@ -26,6 +26,7 @@ import {
   EXPORT_AUDIO_SAMPLE_RATE,
   EXPORT_TARGET_FPS,
   EXPORT_VIDEO_TARGET_KBPS,
+  resolveExportSpeedPreset,
   resolveExportTimelineDuration,
 } from './exportEstimation';
 import { resolveCombinedVideoFilter } from './videoFiltersCatalog';
@@ -809,6 +810,7 @@ export async function renderProjectWithWebCodecs(params: {
   }
 
   const { exportSettings } = project;
+  const speedPreset = resolveExportSpeedPreset(exportSettings.speedProfile);
   const canvasConfig = { ...DEFAULT_VIDEO_CANVAS, ...(project.canvas || {}) };
   const { width, height } = resolveCanvasDimensions(canvasConfig, exportSettings, project.metadata);
   const targetW = Math.max(64, Math.round(width) & ~1);
@@ -1083,10 +1085,10 @@ export async function renderProjectWithWebCodecs(params: {
     codec: capabilities.videoCodec,
     width: targetW,
     height: targetH,
-    bitrate: EXPORT_VIDEO_TARGET_KBPS * 1000,
+    bitrate: speedPreset.videoTargetKbps * 1000,
     framerate: targetFps,
     bitrateMode: 'variable',
-    latencyMode: 'quality',
+    latencyMode: speedPreset.webCodecsLatencyMode,
     hardwareAcceleration: capabilities.hardwareAccelerated ? 'prefer-hardware' : 'no-preference',
     avc: { format: 'avc' },
   });
@@ -1831,7 +1833,7 @@ export async function renderProjectWithWebCodecs(params: {
       videoCodec: capabilities.videoCodec,
       audioCodec: hasAudioTrack ? capabilities.audioCodec || 'aac' : null,
       bitrateControl: 'vbr-bitrate',
-      targetVideoKbps: EXPORT_VIDEO_TARGET_KBPS,
+      targetVideoKbps: speedPreset.videoTargetKbps,
       targetAudioKbps: hasAudioTrack ? EXPORT_AUDIO_BITRATE_KBPS : 0,
       renderDurationMs: Math.round(performance.now() - startedAt),
       audioBranches: mixedAudio.activeBranches,

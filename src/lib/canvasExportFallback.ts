@@ -11,7 +11,7 @@ import {
   computeExportTargetFps,
   EXPORT_AUDIO_BITRATE_KBPS,
   EXPORT_AUDIO_SAMPLE_RATE,
-  EXPORT_VIDEO_TARGET_KBPS,
+  resolveExportSpeedPreset,
   resolveExportTimelineDuration,
 } from './exportEstimation';
 import { getEffectiveVideoClips } from './videoTimeline';
@@ -353,7 +353,8 @@ export async function renderProjectCanvasFallback(params: {
   const combinedStream = new MediaStream(combinedTracks);
 
   // Standard W3C MediaRecorder bitrate targets ONLY (FFmpeg flags do not apply to MediaRecorder)
-  const targetVideoBps = EXPORT_VIDEO_TARGET_KBPS * 1000;
+  const speedPreset = resolveExportSpeedPreset(exportSettings.speedProfile);
+  const targetVideoBps = speedPreset.videoTargetKbps * 1000;
   const targetAudioBps = EXPORT_AUDIO_BITRATE_KBPS * 1000;
   const recorderOptionsAttempts: Array<MediaRecorderOptions | undefined> = [
     {

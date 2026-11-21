@@ -20,6 +20,7 @@ import {
 import {
   DEFAULT_VIDEO_CANVAS,
   ExportSettings,
+  ExportSpeedProfile,
   Project,
   ProjectPatchFn,
   RenderJob,
@@ -28,7 +29,7 @@ import {
 import { api } from '../lib/api';
 import { getBlobAssetByKey } from '../lib/browserStorage';
 import { localProjectService } from '../lib/localProjectService';
-import { estimateExportOutputSize } from '../lib/exportEstimation';
+import { estimateExportOutputSize, resolveExportSpeedPreset } from '../lib/exportEstimation';
 import { formatBytes, formatDurationShort } from '../lib/formatters';
 import { indexedDbStore } from '../lib/indexedDbStore';
 import {
@@ -731,6 +732,48 @@ export function ExportCenterPage({
                     {res}
                   </button>
                 ))}
+              </div>
+            </div>
+
+            <div className="space-y-1.5">
+              <div className="flex items-center justify-between gap-2">
+                <label className="text-xs text-zinc-400">Export Speed</label>
+                <span className="text-[11px] font-mono text-zinc-500">
+                  {resolveExportSpeedPreset(settings.speedProfile).ffmpegPreset} · CRF{' '}
+                  {resolveExportSpeedPreset(settings.speedProfile).crf}
+                </span>
+              </div>
+              <div className="grid grid-cols-3 gap-2">
+                {(
+                  [
+                    ['fast', 'Fast', 'Max speed'],
+                    ['balanced', 'Balanced', 'Default'],
+                    ['high-quality', 'High Quality', 'Best detail'],
+                  ] as Array<[ExportSpeedProfile, string, string]>
+                ).map(([profile, label, hint]) => {
+                  const active = (settings.speedProfile || 'balanced') === profile;
+                  return (
+                    <button
+                      key={profile}
+                      type="button"
+                      onClick={() => void updateSettings({ speedProfile: profile })}
+                      className={`py-1.5 px-2 rounded-lg text-left transition-colors cursor-pointer ${
+                        active
+                          ? 'bg-violet-600 text-white'
+                          : 'bg-[#18181D] text-zinc-300 hover:bg-zinc-800 border border-white/[0.06]'
+                      }`}
+                    >
+                      <div className="text-xs font-medium leading-tight">{label}</div>
+                      <div
+                        className={`text-[10px] leading-tight mt-0.5 ${
+                          active ? 'text-violet-100/90' : 'text-zinc-500'
+                        }`}
+                      >
+                        {hint}
+                      </div>
+                    </button>
+                  );
+                })}
               </div>
             </div>
 

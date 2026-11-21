@@ -33,7 +33,7 @@ import { terminateBrowserFFmpeg } from './clientMediaEngine';
 import {
   computeExportTargetFps,
   EXPORT_AUDIO_BITRATE_KBPS,
-  EXPORT_VIDEO_TARGET_KBPS,
+  resolveExportSpeedPreset,
 } from './exportEstimation';
 import {
   canProjectUseStreamCopy,
@@ -207,6 +207,7 @@ function createDefaultProjectObject(id?: string, name?: string): Project {
       aspectRatio: '9:16',
       resolution: '1080p',
       fitMode: 'blur-pad',
+      speedProfile: 'balanced',
       format: 'mp4',
       videoCodec: 'h264',
       audioCodec: 'aac',
@@ -765,16 +766,17 @@ export const localProjectService = {
       const blobKey = buildAssetBlobKey('exports', project.id, finalOut.filename);
       const durableUrl = await this.saveProjectMedia(project.id, blobKey, finalOut.blob, mimeType);
 
+      const speedPreset = resolveExportSpeedPreset(exportSettings.speedProfile);
       const engineBadgeText =
         usedEngine === 'webcodecs-hardware'
-          ? 'WebCodecs HW H.264'
+          ? `WebCodecs HW H.264 · ${speedPreset.label}`
           : usedEngine === 'webcodecs-software'
-          ? 'WebCodecs Smart H.264'
+          ? `WebCodecs Smart H.264 · ${speedPreset.label}`
           : usedEngine === 'ffmpeg-wasm'
           ? ffmpegResult?.streamCopied
             ? 'FFmpeg Stream Copy'
-            : 'FFmpeg.wasm CRF 27'
-          : 'Canvas Fallback';
+            : `FFmpeg.wasm CRF ${speedPreset.crf} · ${speedPreset.label}`
+          : `Canvas Fallback · ${speedPreset.label}`;
 
       job.status = 'completed';
       job.progress = 100;
@@ -822,7 +824,7 @@ export const localProjectService = {
               videoCodec: ffmpegResult.inspection?.videoCodec || 'h264',
               audioCodec: ffmpegResult.inspection?.audioCodec || null,
               bitrateControl: 'crf' as const,
-              targetVideoKbps: EXPORT_VIDEO_TARGET_KBPS,
+              targetVideoKbps: speedPreset.videoTargetKbps,
               targetAudioKbps: EXPORT_AUDIO_BITRATE_KBPS,
               streamCopied: ffmpegResult.streamCopied,
               multiThreaded: ffmpegResult.multiThreaded,
@@ -835,7 +837,7 @@ export const localProjectService = {
           : {
               hardwareAccelerated: false,
               bitrateControl: 'mediarecorder-vbr' as const,
-              targetVideoKbps: EXPORT_VIDEO_TARGET_KBPS,
+              targetVideoKbps: speedPreset.videoTargetKbps,
               targetAudioKbps: EXPORT_AUDIO_BITRATE_KBPS,
             }),
       };

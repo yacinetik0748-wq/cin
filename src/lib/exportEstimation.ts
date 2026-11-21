@@ -1,4 +1,4 @@
-import { DEFAULT_VIDEO_CANVAS, Project } from '../types/studio';
+import { DEFAULT_VIDEO_CANVAS, ExportSpeedProfile, Project } from '../types/studio';
 import {
   getEffectiveBgmClips,
   getEffectiveOriginalAudioClips,
@@ -19,11 +19,64 @@ export const EXPORT_AUDIO_BITRATE_KBPS = 96; // 96 kbps AAC
 export const EXPORT_AUDIO_SAMPLE_RATE = 44100; // 44.1 kHz
 export const EXPORT_TARGET_FPS = 30;
 
+export interface ResolvedExportSpeedPreset {
+  profile: ExportSpeedProfile;
+  label: string;
+  ffmpegPreset: 'ultrafast' | 'superfast' | 'veryfast';
+  crf: number;
+  videoTargetKbps: number;
+  videoMaxrateKbps: number;
+  videoBufsizeKbps: number;
+  scThreshold: number;
+  webCodecsLatencyMode: 'realtime' | 'quality';
+}
+
+export function resolveExportSpeedPreset(profile?: ExportSpeedProfile): ResolvedExportSpeedPreset {
+  if (profile === 'fast') {
+    return {
+      profile: 'fast',
+      label: 'Fast',
+      ffmpegPreset: 'ultrafast',
+      crf: 27,
+      videoTargetKbps: 1350,
+      videoMaxrateKbps: 1500,
+      videoBufsizeKbps: 3000,
+      scThreshold: 0,
+      webCodecsLatencyMode: 'realtime',
+    };
+  }
+  if (profile === 'high-quality') {
+    return {
+      profile: 'high-quality',
+      label: 'High Quality',
+      ffmpegPreset: 'veryfast',
+      crf: 23,
+      videoTargetKbps: 2200,
+      videoMaxrateKbps: 2500,
+      videoBufsizeKbps: 5000,
+      scThreshold: 40,
+      webCodecsLatencyMode: 'quality',
+    };
+  }
+  return {
+    profile: 'balanced',
+    label: 'Balanced',
+    ffmpegPreset: 'superfast',
+    crf: EXPORT_H264_CRF,
+    videoTargetKbps: EXPORT_VIDEO_TARGET_KBPS,
+    videoMaxrateKbps: EXPORT_VIDEO_MAXRATE_KBPS,
+    videoBufsizeKbps: EXPORT_VIDEO_BUFSIZE_KBPS,
+    scThreshold: 20,
+    webCodecsLatencyMode: 'quality',
+  };
+}
+
 export interface ExportSizeEstimate {
   durationSec: number;
   width: number;
   height: number;
   targetFps: number;
+  speedProfile: ExportSpeedProfile;
   targetVideoKbps: number;
   targetVideoMaxrateKbps: number;
   targetAudioBitrateKbps: number;
@@ -120,6 +173,7 @@ export function computeExportTargetFps(params: {
 
 export function estimateExportOutputSize(project: Project): ExportSizeEstimate {
   const { exportSettings } = project;
+  const speedPreset = resolveExportSpeedPreset(exportSettings.speedProfile);
   const canvas = { ...DEFAULT_VIDEO_CANVAS, ...(project.canvas || {}) };
   const { width, height } = resolveCanvasDimensions(canvas, exportSettings, project.metadata);
   const durationSec = resolveExportTimelineDuration(project);
@@ -165,7 +219,7 @@ export function estimateExportOutputSize(project: Project): ExportSizeEstimate {
   const hasAnyAudio = dubActive || origActive || bgmActive || sfxActive;
   const targetAudioBitrateKbps = hasAnyAudio ? EXPORT_AUDIO_BITRATE_KBPS : 0;
 
-  // Estimate realistic H.264 CRF 27 / 1.2-1.5 Mbps VBR bitrate scaled by pixel area and motion complexity
+  // Estimate realistic H.264 VBR bitrate scaled by pixel area, motion complexity, and chosen speed preset
   const pixelFactor = Math.max(0.25, Math.min(1.12, (width * height) / (1920 * 1080)));
   const fpsFactor = Math.max(0.5, Math.min(1.0, targetFps / 30));
 
@@ -180,17 +234,19 @@ export function estimateExportOutputSize(project: Project): ExportSizeEstimate {
       (exportSettings.applyLogo && project.logos.some((l) => l.enabled && l.motion?.enabled));
     estVideoKbps = Math.round((hasMotionOverlays ? 480 : 220) * Math.sqrt(pixelFactor));
     minVideoKbps = Math.round((hasMotionOverlays ? 280 : 120) * Math.sqrt(pixelFactor));
-    maxVideoKbps = Math.min(EXPORT_VIDEO_MAXRATE_KBPS, Math.round(850 * Math.sqrt(pixelFactor)));
+    maxVideoKbps = Math.min(speedPreset.videoMaxrateKbps, Math.round(850 * Math.sqrt(pixelFactor)));
   } else {
-    // Multi-scene motion + FX/captions constrained to 1.2-1.5 Mbps envelope
     estVideoKbps = Math.min(
-      EXPORT_VIDEO_MAXRATE_KBPS,
-      Math.round(EXPORT_VIDEO_TARGET_KBPS * pixelFactor * fpsFactor)
+      speedPreset.videoMaxrateKbps,
+      Math.round(speedPreset.videoTargetKbps * pixelFactor * fpsFactor)
     );
-    minVideoKbps = Math.min(EXPORT_VIDEO_MAXRATE_KBPS, Math.round(950 * pixelFactor * fpsFactor));
+    minVideoKbps = Math.min(
+      speedPreset.videoMaxrateKbps,
+      Math.round(speedPreset.videoTargetKbps * 0.7 * pixelFactor * fpsFactor)
+    );
     maxVideoKbps = Math.min(
-      EXPORT_VIDEO_MAXRATE_KBPS,
-      Math.round(EXPORT_VIDEO_MAXRATE_KBPS * Math.min(1, pixelFactor * 1.1))
+      speedPreset.videoMaxrateKbps,
+      Math.round(speedPreset.videoMaxrateKbps * Math.min(1, pixelFactor * 1.1))
     );
   }
 
@@ -203,10 +259,11 @@ export function estimateExportOutputSize(project: Project): ExportSizeEstimate {
     width,
     height,
     targetFps,
-    targetVideoKbps: EXPORT_VIDEO_TARGET_KBPS,
-    targetVideoMaxrateKbps: EXPORT_VIDEO_MAXRATE_KBPS,
+    speedProfile: speedPreset.profile,
+    targetVideoKbps: speedPreset.videoTargetKbps,
+    targetVideoMaxrateKbps: speedPreset.videoMaxrateKbps,
     targetAudioBitrateKbps,
-    crf: EXPORT_H264_CRF,
+    crf: speedPreset.crf,
     isStaticVisualMode,
     hasAnyAudio,
     estimatedBytes: toBytes(estVideoKbps),
