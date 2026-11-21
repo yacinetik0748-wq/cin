@@ -479,6 +479,11 @@ function getVisualEffectFilter(
   const enSuffix = enableExpr ? `:enable='${enableExpr}'` : '';
   const steps: string[] = [];
 
+  const smallW = Math.max(32, Math.round(safeW / 4) & ~1);
+  const smallH = Math.max(32, Math.round(safeH / 4) & ~1);
+  const halfW = Math.max(48, Math.round(safeW / 2) & ~1);
+  const halfH = Math.max(48, Math.round(safeH / 2) & ~1);
+
   switch (fx.type) {
     // === VISUAL EFFECTS ===
     case 'glow':
@@ -494,10 +499,13 @@ function getVisualEffectFilter(
           : fx.type === 'bloom'
           ? Math.max(4, Math.round(intensityNorm * 22))
           : Math.max(3, Math.round(intensityNorm * 18));
+      const smallSigma = Math.max(1.5, Number((sigma / 4).toFixed(1)));
       const brightBoost = fx.type === 'bloom' ? 0.2 : fx.type === 'soft-glow' ? 0.1 : 0.14;
       const opacity = Math.min(0.88, Number((intensityNorm * (fx.type === 'bloom' ? 0.78 : 0.68)).toFixed(2)));
       steps.push(`[${inputLabel}]split[${split0}][${split1}]`);
-      steps.push(`[${split1}]gblur=sigma=${sigma}${enSuffix},eq=brightness=${brightBoost}${enSuffix}[${blurred}]`);
+      steps.push(
+        `[${split1}]scale=${smallW}:${smallH}:flags=bilinear,gblur=sigma=${smallSigma}:steps=1,scale=${safeW}:${safeH}:flags=bilinear,eq=brightness=${brightBoost}${enSuffix}[${blurred}]`
+      );
       steps.push(`[${split0}][${blurred}]blend=all_mode=screen:all_opacity=${opacity}${enSuffix}[${out}]`);
       return { steps, lastLabel: out, selfTimed: Boolean(enableExpr) };
     }
@@ -505,7 +513,22 @@ function getVisualEffectFilter(
     case 'gaussian-blur': {
       const sigma = Math.max(1.5, Number((intensityNorm * (fx.type === 'gaussian-blur' ? 28 : 22)).toFixed(1)));
       const out = nextLabel('blur');
-      steps.push(`[${inputLabel}]gblur=sigma=${sigma}:steps=${fx.type === 'gaussian-blur' ? 3 : 2}${enSuffix}[${out}]`);
+      if (sigma >= 9) {
+        const halfSigma = Math.max(2, Number((sigma / 2).toFixed(1)));
+        const blurChain = `scale=${halfW}:${halfH}:flags=bilinear,gblur=sigma=${halfSigma}:steps=2,scale=${safeW}:${safeH}:flags=bilinear,setsar=1`;
+        if (enableExpr) {
+          const s0 = nextLabel('bl0');
+          const s1 = nextLabel('bl1');
+          const bf = nextLabel('blf');
+          steps.push(`[${inputLabel}]split[${s0}][${s1}]`);
+          steps.push(`[${s1}]${blurChain}[${bf}]`);
+          steps.push(`[${s0}][${bf}]overlay=0:0:enable='${enableExpr}'[${out}]`);
+          return { steps, lastLabel: out, selfTimed: true };
+        }
+        steps.push(`[${inputLabel}]${blurChain}[${out}]`);
+        return { steps, lastLabel: out };
+      }
+      steps.push(`[${inputLabel}]gblur=sigma=${sigma}:steps=1${enSuffix}[${out}]`);
       return { steps, lastLabel: out, selfTimed: Boolean(enableExpr) };
     }
     case 'motion-blur': {
@@ -614,19 +637,15 @@ function getVisualEffectFilter(
       const out = nextLabel('flare');
       const s0 = nextLabel('flr0');
       const s1 = nextLabel('flr1');
-      const rad = Math.max(40, Math.round(Math.min(safeW, safeH) * (0.32 + intensityNorm * 0.28)));
-      const radSq = rad * rad;
-      const cxExpr = `W*${posX.toFixed(2)}`;
-      const cyExpr = `H*${posY.toFixed(2)}`;
       const warm = fx.type === 'lens-flare' ? 0.58 : fx.type === 'film-burn' ? 0.74 : 0.64;
       const amp = Number((intensityNorm * warm).toFixed(2));
-      const weightExpr = `${amp}*max(0,1-((X-${cxExpr})*(X-${cxExpr})+(Y-${cyExpr})*(Y-${cyExpr}))/${radSq})`;
+      const vigAngle = (Math.PI * (0.28 + intensityNorm * 0.14)).toFixed(3);
       steps.push(`[${inputLabel}]split[${s0}][${s1}]`);
       steps.push(
-        `[${s1}]eq=brightness=${(0.18 + intensityNorm * 0.25).toFixed(2)}:contrast=1.1${enSuffix},colorbalance=rh=0.35:gh=0.14:bh=-0.18${enSuffix}[${out}_glow]`
+        `[${s1}]scale=${smallW}:${smallH}:flags=bilinear,eq=brightness=${(0.2 + intensityNorm * 0.25).toFixed(2)}:contrast=1.12,colorbalance=rh=0.38:gh=0.14:bh=-0.18,vignette=angle=${vigAngle}:x0=w*${posX.toFixed(2)}:y0=h*${posY.toFixed(2)}:mode=forward:eval=init,scale=${safeW}:${safeH}:flags=bilinear,setsar=1[${out}_glow]`
       );
       steps.push(
-        `[${s0}][${out}_glow]blend=all_expr='A+(B-A)*(${weightExpr})'${enSuffix}[${out}]`
+        `[${s0}][${out}_glow]blend=all_mode=screen:all_opacity=${amp}${enSuffix}[${out}]`
       );
       return { steps, lastLabel: out, selfTimed: Boolean(enableExpr) };
     }
@@ -634,16 +653,33 @@ function getVisualEffectFilter(
       const s0 = nextLabel('bg0');
       const s1 = nextLabel('bg1');
       const blurred = nextLabel('bgb');
+      const fgCrop = nextLabel('bgfg');
+      const comp = nextLabel('bgcomp');
       const out = nextLabel('bgfocus');
       const sigma = Math.max(4, Math.round(intensityNorm * 24));
-      const focusR = Math.max(40, Math.round(Math.min(safeW, safeH) * 0.38));
-      const focusRSq = focusR * focusR;
+      const smallSigma = Math.max(1.5, Number((sigma / 4).toFixed(1)));
+      const fw = Math.max(32, Math.round(safeW * 0.52) & ~1);
+      const fh = Math.max(32, Math.round(safeH * 0.52) & ~1);
+      const fxPos = Math.max(0, Math.min(safeW - fw, Math.round(safeW * posX - fw / 2)));
+      const fyPos = Math.max(0, Math.min(safeH - fh, Math.round(safeH * posY - fh / 2)));
+      if (enableExpr) {
+        const dry = nextLabel('bgdry');
+        steps.push(`[${inputLabel}]split=3[${dry}][${s0}][${s1}]`);
+        steps.push(
+          `[${s1}]scale=${smallW}:${smallH}:flags=bilinear,gblur=sigma=${smallSigma}:steps=1,scale=${safeW}:${safeH}:flags=bilinear,setsar=1[${blurred}]`
+        );
+        steps.push(`[${s0}]crop=${fw}:${fh}:${fxPos}:${fyPos}[${fgCrop}]`);
+        steps.push(`[${blurred}][${fgCrop}]overlay=${fxPos}:${fyPos}[${comp}]`);
+        steps.push(`[${dry}][${comp}]overlay=0:0:enable='${enableExpr}'[${out}]`);
+        return { steps, lastLabel: out, selfTimed: true };
+      }
       steps.push(`[${inputLabel}]split[${s0}][${s1}]`);
-      steps.push(`[${s1}]gblur=sigma=${sigma}${enSuffix}[${blurred}]`);
       steps.push(
-        `[${s0}][${blurred}]blend=all_expr='if(lte((X-W*${posX.toFixed(2)})*(X-W*${posX.toFixed(2)})+(Y-H*${posY.toFixed(2)})*(Y-H*${posY.toFixed(2)}),${focusRSq}),A,B)'${enSuffix}[${out}]`
+        `[${s1}]scale=${smallW}:${smallH}:flags=bilinear,gblur=sigma=${smallSigma}:steps=1,scale=${safeW}:${safeH}:flags=bilinear,setsar=1[${blurred}]`
       );
-      return { steps, lastLabel: out, selfTimed: Boolean(enableExpr) };
+      steps.push(`[${s0}]crop=${fw}:${fh}:${fxPos}:${fyPos}[${fgCrop}]`);
+      steps.push(`[${blurred}][${fgCrop}]overlay=${fxPos}:${fyPos}[${out}]`);
+      return { steps, lastLabel: out };
     }
 
     // === CINEMATIC EFFECTS ===
@@ -652,18 +688,21 @@ function getVisualEffectFilter(
     case 'scratches': {
       const amt = Math.max(
         3,
-        Math.round(intensityNorm * (fx.type === 'dust' ? 28 : fx.type === 'scratches' ? 24 : 32))
+        Math.round(intensityNorm * (fx.type === 'dust' ? 28 : fx.type === 'scratches' ? 22 : 32))
       );
       const out = nextLabel('grain');
       if (fx.type === 'scratches') {
         const s0 = nextLabel('sc0');
         const s1 = nextLabel('sc1');
+        const noised = nextLabel('scn');
+        const line = nextLabel('scl');
         steps.push(`[${inputLabel}]split[${s0}][${s1}]`);
         steps.push(
-          `[${s1}]noise=alls=${amt}:allf=t+u${enSuffix},eq=contrast=1.08:saturation=0.9${enSuffix}[${out}_n]`
+          `[${s0}]noise=alls=${amt}:allf=t+u${enSuffix},eq=contrast=1.06:saturation=0.92${enSuffix}[${noised}]`
         );
+        steps.push(`[${s1}]crop=2:${safeH}:0:0,format=yuva420p,drawbox=t=fill:c=white@0.48[${line}]`);
         steps.push(
-          `[${s0}][${out}_n]blend=all_expr='if(lt(abs(X-W*(0.15+0.7*abs(sin(T*${(speedRate * 3.1).toFixed(2)})))),1.5),min(255,B+85),B)'${enSuffix}[${out}]`
+          `[${noised}][${line}]overlay=x='W*(0.15+0.7*abs(sin(t*${(speedRate * 3.1).toFixed(2)})))':y=0${enSuffix}[${out}]`
         );
       } else {
         steps.push(`[${inputLabel}]noise=alls=${amt}:allf=${fx.type === 'dust' ? 't+p' : 't+u'}${enSuffix}[${out}]`);
@@ -751,11 +790,12 @@ function getVisualEffectFilter(
       const blurred = nextLabel('ngb');
       const out = nextLabel('neonglow');
       const sigma = Math.max(4, Math.round(intensityNorm * 20));
+      const smallSigma = Math.max(1.5, Number((sigma / 4).toFixed(1)));
       const opacity = Math.min(0.85, Number((intensityNorm * 0.72).toFixed(2)));
       const hue = Math.round(fx.hueShiftDeg ?? 18);
       steps.push(`[${inputLabel}]split[${s0}][${s1}]`);
       steps.push(
-        `[${s1}]gblur=sigma=${sigma}${enSuffix},eq=saturation=1.65:brightness=0.14:contrast=1.18${enSuffix},hue=h=${hue}${enSuffix}[${blurred}]`
+        `[${s1}]scale=${smallW}:${smallH}:flags=bilinear,gblur=sigma=${smallSigma}:steps=1,scale=${safeW}:${safeH}:flags=bilinear,eq=saturation=1.65:brightness=0.14:contrast=1.18${enSuffix},hue=h=${hue}${enSuffix}[${blurred}]`
       );
       steps.push(`[${s0}][${blurred}]blend=all_mode=screen:all_opacity=${opacity}${enSuffix}[${out}]`);
       return { steps, lastLabel: out, selfTimed: Boolean(enableExpr) };
@@ -779,13 +819,16 @@ function getVisualEffectFilter(
       const blurred = nextLabel('drb');
       const out = nextLabel('dream');
       const sigma = Math.max(3, Math.round(intensityNorm * (fx.type === 'dream-effect' ? 18 : 12)));
+      const smallSigma = Math.max(1.2, Number((sigma / 4).toFixed(1)));
       const opacity = Number((0.25 + intensityNorm * 0.45).toFixed(2));
       const extra =
         fx.type === 'dream-effect'
           ? `,eq=brightness=0.10:saturation=1.12${enSuffix}`
           : `,eq=brightness=0.04${enSuffix}`;
       steps.push(`[${inputLabel}]split[${s0}][${s1}]`);
-      steps.push(`[${s1}]gblur=sigma=${sigma}${enSuffix}${extra}[${blurred}]`);
+      steps.push(
+        `[${s1}]scale=${smallW}:${smallH}:flags=bilinear,gblur=sigma=${smallSigma}:steps=1,scale=${safeW}:${safeH}:flags=bilinear${extra}[${blurred}]`
+      );
       steps.push(
         `[${s0}][${blurred}]blend=all_mode=normal:all_opacity=${(1 - opacity).toFixed(2)}${enSuffix}[${out}]`
       );
@@ -873,18 +916,14 @@ function getVisualEffectFilter(
       const blk = nextLabel('wpb');
       const out = nextLabel('wipe');
       const dir = fx.direction || 'left';
-      const pExpr = `clip((T-${intervalStart.toFixed(3)})/${span.toFixed(3)},0,1)`;
-      const condExpr =
-        dir === 'right'
-          ? `gte(X,W*(1-${pExpr}))`
-          : dir === 'up'
-          ? `lte(Y,H*${pExpr})`
-          : dir === 'down'
-          ? `gte(Y,H*(1-${pExpr}))`
-          : `lte(X,W*${pExpr})`;
+      const pExpr = `clip((t-${intervalStart.toFixed(3)})/${span.toFixed(3)},0,1)`;
+      const xExpr =
+        dir === 'left' ? `W*${pExpr}` : dir === 'right' ? `-W*${pExpr}` : '0';
+      const yExpr =
+        dir === 'up' ? `H*${pExpr}` : dir === 'down' ? `-H*${pExpr}` : '0';
       steps.push(`[${inputLabel}]split[${s0}][${s1}]`);
       steps.push(`[${s1}]drawbox=t=fill:c=black[${blk}]`);
-      steps.push(`[${s0}][${blk}]blend=all_expr='if(${condExpr},A,B)'${enSuffix}[${out}]`);
+      steps.push(`[${s0}][${blk}]overlay=x='${xExpr}':y='${yExpr}'${enSuffix}[${out}]`);
       return { steps, lastLabel: out, selfTimed: Boolean(enableExpr) };
     }
     case 'blur-transition': {
@@ -893,12 +932,16 @@ function getVisualEffectFilter(
       const blurred = nextLabel('btb');
       const out = nextLabel('blurtr');
       const sigma = Math.max(6, Math.round(intensityNorm * 24));
+      const smallSigma = Math.max(2, Number((sigma / 4).toFixed(1)));
       const half = Math.max(0.08, span / 2);
       const mid = intervalStart + half;
-      const pPeak = `max(0,1-abs(T-${mid.toFixed(3)})/${half.toFixed(3)})`;
       steps.push(`[${inputLabel}]split[${s0}][${s1}]`);
-      steps.push(`[${s1}]gblur=sigma=${sigma}${enSuffix}[${blurred}]`);
-      steps.push(`[${s0}][${blurred}]blend=all_expr='A+(B-A)*(${pPeak})'${enSuffix}[${out}]`);
+      steps.push(
+        `[${s1}]scale=${smallW}:${smallH}:flags=bilinear,gblur=sigma=${smallSigma}:steps=1,scale=${safeW}:${safeH}:flags=bilinear,format=yuva420p,fade=t=in:st=${intervalStart.toFixed(
+          3
+        )}:d=${half.toFixed(3)}:alpha=1,fade=t=out:st=${mid.toFixed(3)}:d=${half.toFixed(3)}:alpha=1[${blurred}]`
+      );
+      steps.push(`[${s0}][${blurred}]overlay=0:0${enSuffix}[${out}]`);
       return { steps, lastLabel: out, selfTimed: Boolean(enableExpr) };
     }
     default:

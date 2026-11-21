@@ -399,10 +399,18 @@ export function buildAssContent(params: {
         continue;
       }
 
+      const transformedLabels = activeWords.map((w) => applyTextTransform(w.word, effStyle));
+      let pendingDiag: { start: number; end: number; payload: string } | null = null;
+      const flushPendingDiag = () => {
+        if (!pendingDiag) return;
+        events.push(
+          `Dialogue: 0,${formatAssTime(pendingDiag.start)},${formatAssTime(pendingDiag.end)},${segStyleName},,0,0,0,,${pendingDiag.payload}`
+        );
+        pendingDiag = null;
+      };
+
       for (let i = 0; i < activeWords.length; i++) {
         const w = activeWords[i];
-        const wStartStr = formatAssTime(w.start);
-        const wEndStr = formatAssTime(w.end);
         const midTime = (w.start + w.end) / 2;
         const slice = buildCaptionDisplaySlice({
           mode: canonicalMode,
@@ -413,7 +421,7 @@ export function buildAssContent(params: {
         });
 
         const lineTokens = slice.words.map((item) => {
-          const label = applyTextTransform(item.word, effStyle);
+          const label = transformedLabels[item.globalIndex] ?? applyTextTransform(item.word, effStyle);
           const isHighlighted =
             canonicalMode === 'karaoke'
               ? item.isPast
@@ -468,10 +476,15 @@ export function buildAssContent(params: {
             ? '{\\t(0,75,\\fscx116\\fscy116)\\t(75,150,\\fscx100\\fscy100)}'
             : animPrefix;
 
-        events.push(
-          `Dialogue: 0,${wStartStr},${wEndStr},${segStyleName},,0,0,0,,${posRot}${wrapTag}${popAnim}${formattedLine}`
-        );
+        const payload = `${posRot}${wrapTag}${popAnim}${formattedLine}`;
+        if (pendingDiag && pendingDiag.payload === payload && w.start <= pendingDiag.end + 0.04) {
+          pendingDiag.end = Math.max(pendingDiag.end, w.end);
+        } else {
+          flushPendingDiag();
+          pendingDiag = { start: w.start, end: w.end, payload };
+        }
       }
+      flushPendingDiag();
     }
   }
 

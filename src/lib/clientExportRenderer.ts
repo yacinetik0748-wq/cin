@@ -1548,23 +1548,23 @@ export async function renderProjectExportInBrowser(params: {
             if (width === srcW && height === srcH) {
               filterSteps.push(`[0:v]setsar=1${fpsCapSuffix}[${currentV}]`);
             } else {
-              filterSteps.push(`[0:v]scale=${width}:${height}:flags=lanczos,setsar=1${fpsCapSuffix}[${currentV}]`);
+              filterSteps.push(`[0:v]scale=${width}:${height}:flags=bicubic,setsar=1${fpsCapSuffix}[${currentV}]`);
             }
           } else if (exportSettings.fitMode === 'crop') {
             filterSteps.push(
-              `[0:v]scale=${width}:${height}:force_original_aspect_ratio=increase:flags=lanczos,crop=${width}:${height},setsar=1${fpsCapSuffix}[${currentV}]`
+              `[0:v]scale=${width}:${height}:force_original_aspect_ratio=increase:flags=bicubic,crop=${width}:${height},setsar=1${fpsCapSuffix}[${currentV}]`
             );
           } else if (exportSettings.fitMode === 'blur-pad') {
             filterSteps.push(`[0:v]${needsFpsCap ? `fps=${targetFps},` : ''}split[v_bg][v_fg]`);
             filterSteps.push(makeFastBackgroundBlurChain('v_bg', 'v_bg_b', width, height, 24));
             filterSteps.push(
-              `[v_fg]scale=${width}:${height}:force_original_aspect_ratio=decrease:flags=lanczos[v_fg_s]`
+              `[v_fg]scale=${width}:${height}:force_original_aspect_ratio=decrease:flags=bicubic[v_fg_s]`
             );
             filterSteps.push(`[v_bg_b][v_fg_s]overlay=(W-w)/2:(H-h)/2,setsar=1[${currentV}]`);
           } else {
             const bgHex = /^#[0-9a-fA-F]{6}$/.test(canvas.bgColor || '') ? canvas.bgColor : '#09090B';
             filterSteps.push(
-              `[0:v]scale=${width}:${height}:force_original_aspect_ratio=decrease:flags=lanczos,pad=${width}:${height}:(ow-iw)/2:(oh-ih)/2:color=${bgHex},setsar=1${fpsCapSuffix}[${currentV}]`
+              `[0:v]scale=${width}:${height}:force_original_aspect_ratio=decrease:flags=bicubic,pad=${width}:${height}:(ow-iw)/2:(oh-ih)/2:color=${bgHex},setsar=1${fpsCapSuffix}[${currentV}]`
             );
           }
         } else {
@@ -1618,7 +1618,7 @@ export async function renderProjectExportInBrowser(params: {
             fgParts.push(`crop=${cw}:${ch}:${cx}:${cy}`);
           }
           if (fgW !== cw || fgH !== ch) {
-            fgParts.push(`scale=${fgW}:${fgH}:flags=lanczos`);
+            fgParts.push(`scale=${fgW}:${fgH}:flags=bicubic`);
           }
           fgParts.push('setsar=1');
           let fgTransformSuffix = fgParts.join(',');
@@ -1636,6 +1636,30 @@ export async function renderProjectExportInBrowser(params: {
           const fgOverlayX = needsFgTransform ? `${Math.round(centerX)}-w/2` : String(Math.round(centerX - fgW / 2));
           const fgOverlayY = needsFgTransform ? `${Math.round(centerY)}-h/2` : String(Math.round(centerY - fgH / 2));
           const bgMemPath = canvas.backgroundType === 'image' && canvas.bgImageUrl && bgVisible ? memfsPaths.get(canvas.bgImageUrl) : undefined;
+
+          const sortedClips = [...videoClips].sort(
+            (a, b) => Number(a.timelineStart || 0) - Number(b.timelineStart || 0)
+          );
+          const clipsNonOverlapping =
+            sortedClips.length > 1 &&
+            sortedClips.every((c, i) => {
+              if (i === 0) return true;
+              const prev = sortedClips[i - 1];
+              const prevEnd =
+                Math.max(0, Number(prev.timelineStart || 0)) + getVideoClipTimelineDuration(prev);
+              return Number(c.timelineStart || 0) >= prevEnd - 0.04;
+            });
+          const canPadSolidDirectly =
+            canvas.backgroundType !== 'blur' &&
+            !bgMemPath &&
+            !needsFgTransform &&
+            Math.abs(canvas.offsetX || 0) <= 0.1 &&
+            Math.abs(canvas.offsetY || 0) <= 0.1 &&
+            fgW <= width &&
+            fgH <= height;
+          const solidBgHex = /^#[0-9a-fA-F]{6}$/.test(canvas.bgColor || '') ? canvas.bgColor : '#09090B';
+          const skipSolidCanvasBgGen =
+            videoVisible && customVideoEdits && clipsNonOverlapping && canPadSolidDirectly;
 
           let bgOut = 'v_canvas_bg';
           const clipCount = videoVisible ? videoClips.length : 0;
@@ -1676,52 +1700,52 @@ export async function renderProjectExportInBrowser(params: {
               for (let i = 0; i < clipCount; i++) clipInLabels.push(`v_clip_in_${i}`);
               filterSteps.push(`[0:v]split=${clipCount}${clipInLabels.map((l) => `[${l}]`).join('')}`);
             }
-            if (bgMemPath) {
-              const bgIdx = nextInputIdx++;
-              // Set -framerate directly on image2 loop input so FFmpeg does not decode at 25fps and duplicate frames
-              extraInputs.push(
-                '-framerate',
-                String(targetFps),
-                '-loop',
-                '1',
-                '-t',
-                totalDur.toFixed(3),
-                '-i',
-                bgMemPath
-              );
-              const bgScale = Math.max(0.5, Math.min(2.5, canvas.bgImageScale || 1));
-              const targetBgW = Math.max(16, Math.round(width * bgScale) & ~1);
-              const targetBgH = Math.max(16, Math.round(height * bgScale) & ~1);
-              const bgShiftX = Math.round(((canvas.bgImageOffsetX || 0) / 100) * width);
-              const bgShiftY = Math.round(((canvas.bgImageOffsetY || 0) / 100) * height);
-
-              if (
-                bgOpacity >= 0.99 &&
-                Math.abs(bgRotDeg) <= 0.2 &&
-                Math.abs(bgScale - 1.0) <= 0.005 &&
-                bgShiftX === 0 &&
-                bgShiftY === 0
-              ) {
-                filterSteps.push(
-                  `[${bgIdx}:v]scale=${width}:${height}:force_original_aspect_ratio=increase:flags=lanczos,crop=${width}:${height},setsar=1[v_canvas_bg]`
+            if (!skipSolidCanvasBgGen) {
+              if (bgMemPath) {
+                const bgIdx = nextInputIdx++;
+                extraInputs.push(
+                  '-framerate',
+                  String(targetFps),
+                  '-loop',
+                  '1',
+                  '-t',
+                  totalDur.toFixed(3),
+                  '-i',
+                  bgMemPath
                 );
-              } else {
-                filterSteps.push(`color=c=#09090B:s=${width}x${height}:r=${targetFps}:d=${totalDur.toFixed(3)}[v_bg_dark]`);
-                let bgChain = `[${bgIdx}:v]scale=${targetBgW}:${targetBgH}:force_original_aspect_ratio=increase,setsar=1`;
-                if (bgOpacity < 0.99 || Math.abs(bgRotDeg) > 0.2) {
-                  bgChain += `,format=rgba`;
-                  if (bgOpacity < 0.99) bgChain += `,colorchannelmixer=aa=${bgOpacity.toFixed(2)}`;
-                  if (Math.abs(bgRotDeg) > 0.2) {
-                    const rad = ((bgRotDeg * Math.PI) / 180).toFixed(4);
-                    bgChain += `,rotate=${rad}:ow='rotw(${rad})':oh='roth(${rad})':c=none`;
+                const bgScale = Math.max(0.5, Math.min(2.5, canvas.bgImageScale || 1));
+                const targetBgW = Math.max(16, Math.round(width * bgScale) & ~1);
+                const targetBgH = Math.max(16, Math.round(height * bgScale) & ~1);
+                const bgShiftX = Math.round(((canvas.bgImageOffsetX || 0) / 100) * width);
+                const bgShiftY = Math.round(((canvas.bgImageOffsetY || 0) / 100) * height);
+
+                if (
+                  bgOpacity >= 0.99 &&
+                  Math.abs(bgRotDeg) <= 0.2 &&
+                  Math.abs(bgScale - 1.0) <= 0.005 &&
+                  bgShiftX === 0 &&
+                  bgShiftY === 0
+                ) {
+                  filterSteps.push(
+                    `[${bgIdx}:v]scale=${width}:${height}:force_original_aspect_ratio=increase:flags=bicubic,crop=${width}:${height},setsar=1[v_canvas_bg]`
+                  );
+                } else {
+                  filterSteps.push(`color=c=#09090B:s=${width}x${height}:r=${targetFps}:d=${totalDur.toFixed(3)}[v_bg_dark]`);
+                  let bgChain = `[${bgIdx}:v]scale=${targetBgW}:${targetBgH}:force_original_aspect_ratio=increase:flags=bicubic,setsar=1`;
+                  if (bgOpacity < 0.99 || Math.abs(bgRotDeg) > 0.2) {
+                    bgChain += `,format=rgba`;
+                    if (bgOpacity < 0.99) bgChain += `,colorchannelmixer=aa=${bgOpacity.toFixed(2)}`;
+                    if (Math.abs(bgRotDeg) > 0.2) {
+                      const rad = ((bgRotDeg * Math.PI) / 180).toFixed(4);
+                      bgChain += `,rotate=${rad}:ow='rotw(${rad})':oh='roth(${rad})':c=none`;
+                    }
                   }
+                  filterSteps.push(`${bgChain}[v_bg_img]`);
+                  filterSteps.push(`[v_bg_dark][v_bg_img]overlay=x=(W-w)/2+${bgShiftX}:y=(H-h)/2+${bgShiftY}:shortest=1[v_canvas_bg]`);
                 }
-                filterSteps.push(`${bgChain}[v_bg_img]`);
-                filterSteps.push(`[v_bg_dark][v_bg_img]overlay=x=(W-w)/2+${bgShiftX}:y=(H-h)/2+${bgShiftY}:shortest=1[v_canvas_bg]`);
+              } else {
+                filterSteps.push(`color=c=${solidBgHex}:s=${width}x${height}:r=${targetFps}:d=${totalDur.toFixed(3)}[v_canvas_bg]`);
               }
-            } else {
-              const bgHex = /^#[0-9a-fA-F]{6}$/.test(canvas.bgColor || '') ? canvas.bgColor : '#09090B';
-              filterSteps.push(`color=c=${bgHex}:s=${width}x${height}:r=${targetFps}:d=${totalDur.toFixed(3)}[v_canvas_bg]`);
             }
           }
 
@@ -1731,6 +1755,46 @@ export async function renderProjectExportInBrowser(params: {
             const capFgFps = needsFpsCap ? `fps=${targetFps},` : '';
             filterSteps.push(`[${clipInLabels[0]}]${capFgFps}${fgTransformSuffix}[v_fg_scaled]`);
             filterSteps.push(`[${bgOut}][v_fg_scaled]overlay=x='${fgOverlayX}':y='${fgOverlayY}':shortest=1,setsar=1[${currentV}]`);
+          } else if (skipSolidCanvasBgGen) {
+            // Fast sequential concat path: eliminates split+N full-frame 1080p overlay filters
+            const concatSegs: string[] = [];
+            let timelineCursor = 0;
+            const padStep =
+              fgW === width && fgH === height
+                ? ''
+                : `,pad=${width}:${height}:(ow-iw)/2:(oh-ih)/2:color=${solidBgHex}`;
+            sortedClips.forEach((clip, idx) => {
+              const sStart = Math.max(0, Number(clip.sourceStart || 0));
+              const sEnd = Math.max(sStart + 0.05, Number(clip.sourceEnd || origDur));
+              const spd = clampVideoSpeed(clip.speed);
+              const tlStart = Math.max(0, Number(clip.timelineStart || 0));
+              const clipDur = getVideoClipTimelineDuration(clip);
+              if (tlStart > timelineCursor + 0.04) {
+                const gapDur = tlStart - timelineCursor;
+                const gapLbl = `v_gap_${idx}`;
+                filterSteps.push(
+                  `color=c=${solidBgHex}:s=${width}x${height}:r=${targetFps}:d=${gapDur.toFixed(3)},setsar=1[${gapLbl}]`
+                );
+                concatSegs.push(`[${gapLbl}]`);
+              }
+              const segLbl = `v_cseg_${idx}`;
+              filterSteps.push(
+                `[${clipInLabels[idx]}]trim=start=${sStart.toFixed(3)}:end=${sEnd.toFixed(
+                  3
+                )},setpts=(PTS-STARTPTS)/${spd.toFixed(4)},fps=${targetFps},${fgTransformSuffix}${padStep},setsar=1[${segLbl}]`
+              );
+              concatSegs.push(`[${segLbl}]`);
+              timelineCursor = Math.max(timelineCursor, tlStart + clipDur);
+            });
+            if (totalDur > timelineCursor + 0.04) {
+              const tailGap = totalDur - timelineCursor;
+              const tailLbl = `v_gap_tail`;
+              filterSteps.push(
+                `color=c=${solidBgHex}:s=${width}x${height}:r=${targetFps}:d=${tailGap.toFixed(3)},setsar=1[${tailLbl}]`
+              );
+              concatSegs.push(`[${tailLbl}]`);
+            }
+            filterSteps.push(`${concatSegs.join('')}concat=n=${concatSegs.length}:v=1:a=0,setsar=1[${currentV}]`);
           } else {
             let bgRunner = bgOut;
             videoClips.forEach((clip, idx) => {
@@ -1947,6 +2011,13 @@ export async function renderProjectExportInBrowser(params: {
         );
       }
 
+      const canStreamCopyAudioOnly =
+        !canStreamCopyVideo &&
+        Boolean(audioRes.audioMapLabel) &&
+        !audioRes.needsReencode &&
+        (srcInfo.audioCodec || '').toLowerCase() === 'aac' &&
+        Math.abs(totalDur - origDur) <= 0.25;
+
       const pureAudioStreamCopy =
         canStreamCopyVideo &&
         Boolean(audioRes.audioMapLabel) &&
@@ -1954,10 +2025,10 @@ export async function renderProjectExportInBrowser(params: {
         (srcInfo.audioCodec || '').toLowerCase() === 'aac';
       const noAudioStreamCopy = canStreamCopyVideo && !audioRes.audioMapLabel;
 
-      if (!pureAudioStreamCopy && !noAudioStreamCopy) {
+      if (!pureAudioStreamCopy && !noAudioStreamCopy && !canStreamCopyAudioOnly) {
         extraInputs.push(...audioRes.extraInputs);
         filterSteps.push(...audioRes.filterSteps);
-      } else {
+      } else if (pureAudioStreamCopy || noAudioStreamCopy) {
         extraInputs.length = 0;
         filterSteps.length = 0;
       }
@@ -1986,7 +2057,9 @@ export async function renderProjectExportInBrowser(params: {
         );
       } else {
         args.push('-filter_complex', filterSteps.join(';'), '-map', `[${currentV}]`);
-        if (audioRes.audioMapLabel) {
+        if (canStreamCopyAudioOnly) {
+          args.push('-map', '0:a:0', '-c:a', 'copy');
+        } else if (audioRes.audioMapLabel) {
           args.push(
             '-map', audioRes.audioMapLabel,
             '-c:a', 'aac',

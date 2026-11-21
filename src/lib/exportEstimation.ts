@@ -11,10 +11,11 @@ import {
 } from './videoTimeline';
 import { resolveCanvasDimensions } from './workflowStages';
 
-export const EXPORT_H264_CRF = 24; // Within target CRF 23-26 range
-export const EXPORT_VIDEO_MAXRATE_KBPS = 2500; // 2.5 Mbps target cap
-export const EXPORT_VIDEO_BUFSIZE_KBPS = 5000;
-export const EXPORT_AUDIO_BITRATE_KBPS = 128; // 128 kbps AAC
+export const EXPORT_H264_CRF = 27; // Compact CRF 27-28 range (FFmpeg libx264 only)
+export const EXPORT_VIDEO_TARGET_KBPS = 1350; // 1.2-1.5 Mbps target bitrate (WebCodecs / MediaRecorder)
+export const EXPORT_VIDEO_MAXRATE_KBPS = 1500; // 1.5 Mbps VBV maxrate cap
+export const EXPORT_VIDEO_BUFSIZE_KBPS = 3000;
+export const EXPORT_AUDIO_BITRATE_KBPS = 96; // 96 kbps AAC
 export const EXPORT_AUDIO_SAMPLE_RATE = 44100; // 44.1 kHz
 export const EXPORT_TARGET_FPS = 30;
 
@@ -23,6 +24,7 @@ export interface ExportSizeEstimate {
   width: number;
   height: number;
   targetFps: number;
+  targetVideoKbps: number;
   targetVideoMaxrateKbps: number;
   targetAudioBitrateKbps: number;
   crf: number;
@@ -163,8 +165,8 @@ export function estimateExportOutputSize(project: Project): ExportSizeEstimate {
   const hasAnyAudio = dubActive || origActive || bgmActive || sfxActive;
   const targetAudioBitrateKbps = hasAnyAudio ? EXPORT_AUDIO_BITRATE_KBPS : 0;
 
-  // Estimate realistic H.264 CRF 24 bitrate scaled by pixel area and motion complexity, capped at 2.5 Mbps
-  const pixelFactor = Math.max(0.2, Math.min(1.15, (width * height) / (1920 * 1080)));
+  // Estimate realistic H.264 CRF 27 / 1.2-1.5 Mbps VBR bitrate scaled by pixel area and motion complexity
+  const pixelFactor = Math.max(0.25, Math.min(1.12, (width * height) / (1920 * 1080)));
   const fpsFactor = Math.max(0.5, Math.min(1.0, targetFps / 30));
 
   let estVideoKbps: number;
@@ -176,17 +178,23 @@ export function estimateExportOutputSize(project: Project): ExportSizeEstimate {
     const hasMotionOverlays =
       (exportSettings.applyCaptions && project.captions.length > 0) ||
       (exportSettings.applyLogo && project.logos.some((l) => l.enabled && l.motion?.enabled));
-    estVideoKbps = Math.round((hasMotionOverlays ? 720 : 320) * Math.sqrt(pixelFactor));
-    minVideoKbps = Math.round((hasMotionOverlays ? 420 : 180) * Math.sqrt(pixelFactor));
-    maxVideoKbps = Math.min(EXPORT_VIDEO_MAXRATE_KBPS, Math.round(1350 * Math.sqrt(pixelFactor)));
+    estVideoKbps = Math.round((hasMotionOverlays ? 480 : 220) * Math.sqrt(pixelFactor));
+    minVideoKbps = Math.round((hasMotionOverlays ? 280 : 120) * Math.sqrt(pixelFactor));
+    maxVideoKbps = Math.min(EXPORT_VIDEO_MAXRATE_KBPS, Math.round(850 * Math.sqrt(pixelFactor)));
   } else {
-    // Normal recap motion footage capped by -maxrate 2500k
-    estVideoKbps = Math.min(EXPORT_VIDEO_MAXRATE_KBPS, Math.round(1950 * pixelFactor * fpsFactor));
-    minVideoKbps = Math.min(EXPORT_VIDEO_MAXRATE_KBPS, Math.round(1250 * pixelFactor * fpsFactor));
-    maxVideoKbps = Math.min(EXPORT_VIDEO_MAXRATE_KBPS, Math.round(EXPORT_VIDEO_MAXRATE_KBPS * Math.min(1, pixelFactor * 1.15)));
+    // Multi-scene motion + FX/captions constrained to 1.2-1.5 Mbps envelope
+    estVideoKbps = Math.min(
+      EXPORT_VIDEO_MAXRATE_KBPS,
+      Math.round(EXPORT_VIDEO_TARGET_KBPS * pixelFactor * fpsFactor)
+    );
+    minVideoKbps = Math.min(EXPORT_VIDEO_MAXRATE_KBPS, Math.round(950 * pixelFactor * fpsFactor));
+    maxVideoKbps = Math.min(
+      EXPORT_VIDEO_MAXRATE_KBPS,
+      Math.round(EXPORT_VIDEO_MAXRATE_KBPS * Math.min(1, pixelFactor * 1.1))
+    );
   }
 
-  const containerOverhead = 1.015; // MP4 moov/mdat framing (~1.5%)
+  const containerOverhead = 1.012; // MP4 moov/mdat framing (~1.2%)
   const toBytes = (vKbps: number) =>
     Math.round((((vKbps + targetAudioBitrateKbps) * 1000) / 8) * durationSec * containerOverhead);
 
@@ -195,6 +203,7 @@ export function estimateExportOutputSize(project: Project): ExportSizeEstimate {
     width,
     height,
     targetFps,
+    targetVideoKbps: EXPORT_VIDEO_TARGET_KBPS,
     targetVideoMaxrateKbps: EXPORT_VIDEO_MAXRATE_KBPS,
     targetAudioBitrateKbps,
     crf: EXPORT_H264_CRF,

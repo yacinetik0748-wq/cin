@@ -1,4 +1,5 @@
 import {
+  DEFAULT_VIDEO_CANVAS,
   DefaultStudioPreferences,
   FilmstripFrame,
   Project,
@@ -30,11 +31,23 @@ import {
 import { renderProjectCanvasFallback } from './canvasExportFallback';
 import { terminateBrowserFFmpeg } from './clientMediaEngine';
 import {
+  computeExportTargetFps,
+  EXPORT_AUDIO_BITRATE_KBPS,
+  EXPORT_VIDEO_TARGET_KBPS,
+} from './exportEstimation';
+import {
+  canProjectUseStreamCopy,
+  detectSmartExportCapabilities,
+  renderProjectWithWebCodecs,
+  WebCodecsExportResult,
+} from './webcodecsExportRenderer';
+import {
   createDefaultMainVideoClip,
   getEffectiveBgmClips,
   getEffectiveSfxClips,
+  getEffectiveVideoClips,
 } from './videoTimeline';
-import { createWorkflowUpdate } from './workflowStages';
+import { createWorkflowUpdate, resolveCanvasDimensions } from './workflowStages';
 
 const activeExportControllers = new Map<string, AbortController>();
 
@@ -573,7 +586,16 @@ export const localProjectService = {
     url: string;
     filename: string;
     mimeType: string;
-    engine: 'ffmpeg-wasm' | 'canvas-mediarecorder';
+    engine: 'webcodecs-hardware' | 'webcodecs-software' | 'ffmpeg-wasm' | 'canvas-mediarecorder';
+    hardwareAccelerated?: boolean;
+    videoCodec?: string | null;
+    audioCodec?: string | null;
+    bitrateControl?: 'vbr-bitrate' | 'crf' | 'mediarecorder-vbr';
+    targetVideoKbps?: number;
+    targetAudioKbps?: number;
+    framesRendered?: number;
+    staticFramesReused?: number;
+    peakHeapMb?: number | null;
     streamCopied?: boolean;
     multiThreaded?: boolean;
     renderDurationMs?: number;
@@ -608,7 +630,7 @@ export const localProjectService = {
       type: 'render',
       status: 'processing',
       progress: 5,
-      stage: 'Preparing media',
+      stage: 'Detecting hardware & browser export capabilities...',
       etaSeconds: null,
       outputUrl: null,
       outputSize: null,
@@ -618,102 +640,154 @@ export const localProjectService = {
     };
     await idbSet('jobs', jobId, job);
 
+    const reportProgress = (pct: number, stage: string, etaSec?: number | null) => {
+      job.progress = pct;
+      job.stage = stage;
+      if (etaSec !== undefined) {
+        job.etaSeconds = etaSec;
+      }
+      job.updatedAt = new Date().toISOString();
+      void idbSet('jobs', jobId, job).catch(() => {});
+      if (onProgress) onProgress(pct, stage, etaSec);
+    };
+
     let ffmpegResult: ExportRenderResult | null = null;
-    let renderResult: { blob: Blob; filename: string; sizeBytes: number };
-    let usedEngine: 'ffmpeg-wasm' | 'canvas-mediarecorder' = 'ffmpeg-wasm';
+    let webCodecsResult: WebCodecsExportResult | null = null;
+    let renderResult: { blob: Blob; filename: string; sizeBytes: number } | null = null;
+    let usedEngine:
+      | 'webcodecs-hardware'
+      | 'webcodecs-software'
+      | 'ffmpeg-wasm'
+      | 'canvas-mediarecorder' = 'ffmpeg-wasm';
+
+    const failJob = async (err: unknown): Promise<never> => {
+      const errMessage = err instanceof Error ? err.message : String(err);
+      const isAbort =
+        controller.signal.aborted || (err instanceof Error && err.name === 'AbortError');
+      const isValidationError = err instanceof ExportValidationError;
+      job.status = 'failed';
+      job.stage = isAbort
+        ? 'Export cancelled'
+        : isValidationError
+        ? 'Export validation failed'
+        : 'Export failed';
+      job.etaSeconds = null;
+      job.error = errMessage;
+      job.updatedAt = new Date().toISOString();
+      await idbSet('jobs', jobId, job).catch(() => {});
+      throw err;
+    };
 
     try {
-      try {
-        // Primary: Try browser FFmpeg WebAssembly engine
-        ffmpegResult = await renderProjectExportInBrowser({
-          project,
-          resolveUrlFn: (u) => u,
-          signal: controller.signal,
-          onProgress: (pct, stage, etaSec) => {
-            job.progress = pct;
-            job.stage = stage;
-            if (etaSec !== undefined) {
-              job.etaSeconds = etaSec;
-            }
-            job.updatedAt = new Date().toISOString();
-            void idbSet('jobs', jobId, job).catch(() => {});
-            if (onProgress) onProgress(pct, stage, etaSec);
-          },
-        });
-        renderResult = ffmpegResult;
-      } catch (ffmpegErr) {
-        const isAbort =
-          controller.signal.aborted ||
-          (ffmpegErr instanceof Error && ffmpegErr.name === 'AbortError');
-        const isValidationError = ffmpegErr instanceof ExportValidationError;
+      const canvasCfg = { ...DEFAULT_VIDEO_CANVAS, ...(project.canvas || {}) };
+      const dims = resolveCanvasDimensions(canvasCfg, exportSettings, project.metadata);
+      const targetFps = computeExportTargetFps({
+        sourceFps: project.metadata?.fps,
+        videoVisible: canvasCfg.videoVisible !== false,
+        videoClipCount: getEffectiveVideoClips(project).length,
+      });
 
-        if (isAbort || isValidationError) {
-          const errMessage =
-            ffmpegErr instanceof Error ? ffmpegErr.message : String(ffmpegErr);
-          job.status = 'failed';
-          job.stage = isAbort ? 'Export cancelled' : 'Export validation failed';
-          job.etaSeconds = null;
-          job.error = errMessage;
-          job.updatedAt = new Date().toISOString();
-          await idbSet('jobs', jobId, job).catch(() => {});
-          throw ffmpegErr;
-        }
+      const streamCopyEligible = canProjectUseStreamCopy(project);
+      const caps = await detectSmartExportCapabilities(dims.width, dims.height, targetFps);
 
-        console.warn('[LocalExport] FFmpeg.wasm failed or unavailable, using Canvas fallback:', ffmpegErr);
-        usedEngine = 'canvas-mediarecorder';
-        job.stage = 'Switching to browser Canvas + MediaRecorder fallback...';
-        job.etaSeconds = null;
-        void idbSet('jobs', jobId, job).catch(() => {});
-
+      // 1. Try WebCodecs Hardware/Smart encoder first whenever project is NOT pure stream-copy
+      if (!streamCopyEligible && caps.webCodecsVideo) {
         try {
-          // Fallback: Canvas + Web Audio + MediaRecorder for Android/low-memory browsers
-          renderResult = await renderProjectCanvasFallback({
+          webCodecsResult = await renderProjectWithWebCodecs({
             project,
+            capabilities: caps,
             signal: controller.signal,
-            onProgress: (pct, stage, etaSec) => {
-              job.progress = pct;
-              job.stage = stage;
-              if (etaSec !== undefined) {
-                job.etaSeconds = etaSec;
-              }
-              job.updatedAt = new Date().toISOString();
-              void idbSet('jobs', jobId, job).catch(() => {});
-              if (onProgress) onProgress(pct, stage, etaSec);
-            },
+            onProgress: reportProgress,
           });
-        } catch (fallbackErr) {
-          const errMessage =
-            fallbackErr instanceof Error ? fallbackErr.message : String(fallbackErr);
-          job.status = 'failed';
-          job.stage = controller.signal.aborted ? 'Export cancelled' : 'Export failed';
-          job.etaSeconds = null;
-          job.error = errMessage;
-          job.updatedAt = new Date().toISOString();
-          await idbSet('jobs', jobId, job).catch(() => {});
-          throw fallbackErr;
+          renderResult = webCodecsResult;
+          usedEngine = webCodecsResult.engine;
+        } catch (wcErr) {
+          const isAbort =
+            controller.signal.aborted ||
+            (wcErr instanceof Error && wcErr.name === 'AbortError');
+          if (isAbort || wcErr instanceof ExportValidationError) {
+            await failJob(wcErr);
+          }
+          console.warn(
+            '[LocalExport] WebCodecs renderer failed or was rejected by device encoder, falling back to FFmpeg.wasm:',
+            wcErr
+          );
+          reportProgress(8, 'Switching to FFmpeg.wasm software H.264 encoder...', null);
         }
       }
 
-      const mimeType =
-        renderResult.blob.type ||
-        (renderResult.filename.toLowerCase().endsWith('.webm') ? 'video/webm' : 'video/mp4');
-      const extLabel = renderResult.filename.toLowerCase().endsWith('.webm') ? 'WEBM' : 'MP4';
+      // 2. FFmpeg.wasm path (for stream-copy projects OR when WebCodecs is unavailable/failed)
+      if (!renderResult) {
+        try {
+          usedEngine = 'ffmpeg-wasm';
+          ffmpegResult = await renderProjectExportInBrowser({
+            project,
+            resolveUrlFn: (u) => u,
+            signal: controller.signal,
+            onProgress: reportProgress,
+          });
+          renderResult = ffmpegResult;
+        } catch (ffmpegErr) {
+          const isAbort =
+            controller.signal.aborted ||
+            (ffmpegErr instanceof Error && ffmpegErr.name === 'AbortError');
+          if (isAbort || ffmpegErr instanceof ExportValidationError) {
+            await failJob(ffmpegErr);
+          }
 
-      const blobKey = buildAssetBlobKey('exports', project.id, renderResult.filename);
-      const durableUrl = await this.saveProjectMedia(project.id, blobKey, renderResult.blob, mimeType);
+          console.warn('[LocalExport] FFmpeg.wasm failed or unavailable, using Canvas fallback:', ffmpegErr);
+          usedEngine = 'canvas-mediarecorder';
+          reportProgress(12, 'Switching to browser Canvas + MediaRecorder fallback...', null);
+
+          try {
+            // 3. Fallback: Canvas + Web Audio + MediaRecorder for Android/low-memory browsers
+            renderResult = await renderProjectCanvasFallback({
+              project,
+              signal: controller.signal,
+              onProgress: reportProgress,
+            });
+          } catch (fallbackErr) {
+            await failJob(fallbackErr);
+          }
+        }
+      }
+
+      if (!renderResult) {
+        await failJob(new Error('All local video export engines failed to produce an output file.'));
+      }
+
+      const finalOut = renderResult!;
+      const mimeType =
+        finalOut.blob.type ||
+        (finalOut.filename.toLowerCase().endsWith('.webm') ? 'video/webm' : 'video/mp4');
+      const extLabel = finalOut.filename.toLowerCase().endsWith('.webm') ? 'WEBM' : 'MP4';
+
+      const blobKey = buildAssetBlobKey('exports', project.id, finalOut.filename);
+      const durableUrl = await this.saveProjectMedia(project.id, blobKey, finalOut.blob, mimeType);
+
+      const engineBadgeText =
+        usedEngine === 'webcodecs-hardware'
+          ? 'WebCodecs HW H.264'
+          : usedEngine === 'webcodecs-software'
+          ? 'WebCodecs Smart H.264'
+          : usedEngine === 'ffmpeg-wasm'
+          ? ffmpegResult?.streamCopied
+            ? 'FFmpeg Stream Copy'
+            : 'FFmpeg.wasm CRF 27'
+          : 'Canvas Fallback';
 
       job.status = 'completed';
       job.progress = 100;
       job.etaSeconds = 0;
-      job.stage = `Export completed (${extLabel} · ${usedEngine === 'ffmpeg-wasm' ? 'FFmpeg.wasm' : 'Canvas Fallback'})`;
+      job.stage = `Export completed (${extLabel} · ${engineBadgeText})`;
       job.outputUrl = durableUrl;
-      job.outputSize = renderResult.sizeBytes;
+      job.outputSize = finalOut.sizeBytes;
       job.updatedAt = new Date().toISOString();
       await idbSet('jobs', jobId, job);
 
       await this.updateProject(project.id, {
         lastExportUrl: durableUrl,
-        lastExportSize: renderResult.sizeBytes,
+        lastExportSize: finalOut.sizeBytes,
         lastExportedAt: new Date().toISOString(),
         workflow: createWorkflowUpdate(project.workflow, {
           completeStage: 'export',
@@ -723,13 +797,33 @@ export const localProjectService = {
 
       return {
         job,
-        blob: renderResult.blob,
+        blob: finalOut.blob,
         url: durableUrl,
-        filename: renderResult.filename,
+        filename: finalOut.filename,
         mimeType,
         engine: usedEngine,
-        ...(ffmpegResult
+        ...(webCodecsResult
           ? {
+              hardwareAccelerated: webCodecsResult.hardwareAccelerated,
+              videoCodec: webCodecsResult.videoCodec,
+              audioCodec: webCodecsResult.audioCodec,
+              bitrateControl: webCodecsResult.bitrateControl,
+              targetVideoKbps: webCodecsResult.targetVideoKbps,
+              targetAudioKbps: webCodecsResult.targetAudioKbps,
+              renderDurationMs: webCodecsResult.renderDurationMs,
+              audioBranches: webCodecsResult.audioBranches,
+              framesRendered: webCodecsResult.framesRendered,
+              staticFramesReused: webCodecsResult.staticFramesReused,
+              peakHeapMb: webCodecsResult.peakHeapMb,
+            }
+          : ffmpegResult
+          ? {
+              hardwareAccelerated: false,
+              videoCodec: ffmpegResult.inspection?.videoCodec || 'h264',
+              audioCodec: ffmpegResult.inspection?.audioCodec || null,
+              bitrateControl: 'crf' as const,
+              targetVideoKbps: EXPORT_VIDEO_TARGET_KBPS,
+              targetAudioKbps: EXPORT_AUDIO_BITRATE_KBPS,
               streamCopied: ffmpegResult.streamCopied,
               multiThreaded: ffmpegResult.multiThreaded,
               renderDurationMs: ffmpegResult.renderDurationMs,
@@ -738,7 +832,12 @@ export const localProjectService = {
               ffmpegArgsSummary: ffmpegResult.ffmpegArgsSummary,
               inspection: ffmpegResult.inspection,
             }
-          : {}),
+          : {
+              hardwareAccelerated: false,
+              bitrateControl: 'mediarecorder-vbr' as const,
+              targetVideoKbps: EXPORT_VIDEO_TARGET_KBPS,
+              targetAudioKbps: EXPORT_AUDIO_BITRATE_KBPS,
+            }),
       };
     } finally {
       activeExportControllers.delete(projectId);

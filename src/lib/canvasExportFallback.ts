@@ -3,7 +3,7 @@ import {
   Project,
 } from '../types/studio';
 import { getSyncedCaptionsForPreview, resolveCanvasDimensions } from './workflowStages';
-import { applyTextTransform, buildCaptionDisplaySlice, normalizeCanonicalMode } from './captionModes';
+import { buildPrecomputedCaptionCache, drawCachedCaptionsAtTime } from './captionLayoutCache';
 import { retrieveProjectVideoBlob, getBlobAssetByKey } from './browserStorage';
 import { isOrigAudioActive } from './clientExportRenderer';
 import { resolveMediaBlob } from './clientMediaEngine';
@@ -11,7 +11,7 @@ import {
   computeExportTargetFps,
   EXPORT_AUDIO_BITRATE_KBPS,
   EXPORT_AUDIO_SAMPLE_RATE,
-  EXPORT_VIDEO_MAXRATE_KBPS,
+  EXPORT_VIDEO_TARGET_KBPS,
   resolveExportTimelineDuration,
 } from './exportEstimation';
 import { getEffectiveVideoClips } from './videoTimeline';
@@ -171,6 +171,24 @@ export async function renderProjectCanvasFallback(params: {
   }
 
   const syncedCaptions = getSyncedCaptionsForPreview(project);
+  const captionsEnabled = Boolean(
+    exportSettings.applyCaptions &&
+      project.subtitleStyle.enabled &&
+      project.subtitleStyle.visible !== false &&
+      (syncedCaptions.length > 0 || (project.subtitleStyle.extraElements || []).some((e) => e.visible))
+  );
+  const captionCache = captionsEnabled
+    ? buildPrecomputedCaptionCache(project, targetW, targetH, syncedCaptions)
+    : null;
+  const captionCursor = { index: 0 };
+
+  // Reusable quarter-res scratch canvas for blur-pad & selective blurs (16x fewer pixels per frame)
+  const qW = Math.max(32, Math.round(targetW / 4) & ~1);
+  const qH = Math.max(32, Math.round(targetH / 4) & ~1);
+  const qCanvas = document.createElement('canvas');
+  qCanvas.width = qW;
+  qCanvas.height = qH;
+  const qCtx = qCanvas.getContext('2d');
 
   // Web Audio Context for audio mixing (Android Chrome safe, 44.1 kHz target)
   const AudioContextClass =
@@ -334,8 +352,8 @@ export async function renderProjectCanvasFallback(params: {
   }
   const combinedStream = new MediaStream(combinedTracks);
 
-  // Standard W3C MediaRecorder bitrate caps ONLY (FFmpeg flags do not apply to MediaRecorder)
-  const targetVideoBps = EXPORT_VIDEO_MAXRATE_KBPS * 1000;
+  // Standard W3C MediaRecorder bitrate targets ONLY (FFmpeg flags do not apply to MediaRecorder)
+  const targetVideoBps = EXPORT_VIDEO_TARGET_KBPS * 1000;
   const targetAudioBps = EXPORT_AUDIO_BITRATE_KBPS * 1000;
   const recorderOptionsAttempts: Array<MediaRecorderOptions | undefined> = [
     {
@@ -562,32 +580,57 @@ export async function renderProjectCanvasFallback(params: {
         ctx.save();
         ctx.globalAlpha = Math.max(0.05, Math.min(1, canvasConfig.videoOpacity ?? 1));
         if (exportSettings.fitMode === 'blur-pad') {
-          const bgScale = Math.max(targetW / vw, targetH / vh);
-          const bw = vw * bgScale;
-          const bh = vh * bgScale;
-          ctx.filter = 'blur(18px) brightness(0.7)';
-          ctx.drawImage(video, (targetW - bw) / 2, (targetH - bh) / 2, bw, bh);
-          ctx.filter = 'none';
+          if (qCtx) {
+            const bgScale = Math.max(qW / vw, qH / vh);
+            const bw = vw * bgScale;
+            const bh = vh * bgScale;
+            qCtx.save();
+            qCtx.filter = 'blur(6px) brightness(0.72)';
+            qCtx.drawImage(video, (qW - bw) / 2, (qH - bh) / 2, bw, bh);
+            qCtx.restore();
+            ctx.drawImage(qCanvas, 0, 0, targetW, targetH);
+          } else {
+            const bgScale = Math.max(targetW / vw, targetH / vh);
+            const bw = vw * bgScale;
+            const bh = vh * bgScale;
+            ctx.filter = 'blur(18px) brightness(0.7)';
+            ctx.drawImage(video, (targetW - bw) / 2, (targetH - bh) / 2, bw, bh);
+            ctx.filter = 'none';
+          }
         }
         ctx.drawImage(video, dx, dy, dw, dh);
         ctx.restore();
 
-        // 3. Draw active blur zones
+        // 3. Draw active blur zones via quarter-res canvas (fast & crisp)
         if (exportSettings.applyBlur && project.blurs.length > 0) {
-          for (const blur of project.blurs.filter(
+          const activeBlurs = project.blurs.filter(
             (b) => b.enabled && timelineTime >= b.startTime && timelineTime <= b.endTime
-          )) {
-            const bx = blur.mode === 'full' ? 0 : blur.x * targetW;
-            const by = blur.mode === 'full' ? 0 : blur.y * targetH;
-            const bw = blur.mode === 'full' ? targetW : blur.width * targetW;
-            const bh = blur.mode === 'full' ? targetH : blur.height * targetH;
-            ctx.save();
-            ctx.beginPath();
-            ctx.rect(bx, by, bw, bh);
-            ctx.clip();
-            ctx.filter = `blur(${Math.max(4, Math.min(32, blur.radius || blur.intensity || 16))}px)`;
-            ctx.drawImage(video, dx, dy, dw, dh);
-            ctx.restore();
+          );
+          if (activeBlurs.length > 0) {
+            if (qCtx) {
+              qCtx.save();
+              qCtx.clearRect(0, 0, qW, qH);
+              qCtx.filter = 'blur(5px)';
+              qCtx.drawImage(canvas, 0, 0, qW, qH);
+              qCtx.restore();
+            }
+            for (const blur of activeBlurs) {
+              const bx = blur.mode === 'full' ? 0 : blur.x * targetW;
+              const by = blur.mode === 'full' ? 0 : blur.y * targetH;
+              const bw = blur.mode === 'full' ? targetW : blur.width * targetW;
+              const bh = blur.mode === 'full' ? targetH : blur.height * targetH;
+              ctx.save();
+              ctx.beginPath();
+              ctx.rect(bx, by, bw, bh);
+              ctx.clip();
+              if (qCtx) {
+                ctx.drawImage(qCanvas, 0, 0, targetW, targetH);
+              } else {
+                ctx.filter = `blur(${Math.max(4, Math.min(32, blur.radius || blur.intensity || 16))}px)`;
+                ctx.drawImage(video, dx, dy, dw, dh);
+              }
+              ctx.restore();
+            }
           }
         }
       }
@@ -608,114 +651,9 @@ export async function renderProjectCanvasFallback(params: {
         }
       }
 
-      // 5. Draw active synced captions with karaoke / active-word highlighting preserved
-      if (
-        exportSettings.applyCaptions &&
-        project.subtitleStyle.enabled &&
-        project.subtitleStyle.visible !== false &&
-        syncedCaptions.length > 0
-      ) {
-        const activeCaption = syncedCaptions.find(
-          (c) => timelineTime >= c.syncedStart && timelineTime <= c.syncedEnd
-        );
-        if (activeCaption) {
-          const style = project.subtitleStyle;
-          const mode = normalizeCanonicalMode(style.mode);
-          const slice = buildCaptionDisplaySlice({
-            mode: style.mode,
-            words: activeCaption.words || [],
-            currentTime: timelineTime,
-            wordsPerDisplay: style.wordsPerDisplay,
-            chunkSize: style.chunkSize,
-          });
-          const scaleMul = Math.max(0.5, Math.min(2.5, style.scale || 1));
-          const fs = Math.max(18, Math.round((style.fontSize || Math.round(targetH * 0.042)) * (targetH / 1080) * scaleMul));
-          const fontWeight = style.fontWeight || 'bold';
-          ctx.font = `${style.italic ? 'italic ' : ''}${fontWeight} ${fs}px ${style.fontFamily || 'sans-serif'}`;
-          ctx.textBaseline = 'middle';
-          const outlineCol = style.outlineColor || '#000000';
-          const primaryCol = style.primaryColor || '#FFFFFF';
-          const highlightCol = style.highlightColor || '#FACC15';
-          ctx.strokeStyle = outlineCol;
-          ctx.lineWidth = Math.max(2, Math.round((style.outlineWidth || 3) * (fs / 38)));
-          ctx.lineJoin = 'round';
-
-          const maxTextW = (Math.max(30, Math.min(100, style.maxWidthPct || 86)) / 100) * targetW;
-          const posYFrac =
-            style.position === 'top'
-              ? 0.14
-              : style.position === 'middle'
-              ? 0.5
-              : style.position === 'custom'
-              ? Math.max(0.08, Math.min(0.92, (style.posY || 85) / 100))
-              : 0.85;
-          const baseCenterX =
-            style.position === 'custom'
-              ? Math.max(0.1, Math.min(0.9, (style.posX || 50) / 100)) * targetW
-              : targetW / 2;
-
-          if (slice.words.length > 0) {
-            const spaceW = ctx.measureText(' ').width;
-            const tokens = slice.words.map((w) => {
-              const displayWord = applyTextTransform(w.word, style);
-              const isHighlighted =
-                mode === 'karaoke' || mode === 'progressive-reveal' || mode === 'typewriter'
-                  ? w.isPast
-                  : w.isActive;
-              return {
-                text: displayWord,
-                width: ctx.measureText(displayWord).width,
-                isHighlighted,
-              };
-            });
-
-            // Wrap into lines cleanly
-            const lines: Array<typeof tokens> = [];
-            let currentLine: typeof tokens = [];
-            let currentLineW = 0;
-            for (const tok of tokens) {
-              const nextW = currentLine.length === 0 ? tok.width : currentLineW + spaceW + tok.width;
-              if (currentLine.length > 0 && nextW > maxTextW) {
-                lines.push(currentLine);
-                currentLine = [tok];
-                currentLineW = tok.width;
-              } else {
-                currentLine.push(tok);
-                currentLineW = nextW;
-              }
-            }
-            if (currentLine.length > 0) lines.push(currentLine);
-
-            const lineHeight = fs * (1.28 + Math.max(0, style.lineSpacing || 0) * 0.04);
-            const totalTextH = lines.length * lineHeight;
-            const startY = targetH * posYFrac - totalTextH / 2 + lineHeight / 2;
-
-            lines.forEach((line, lIdx) => {
-              const lineW =
-                line.reduce((sum, t) => sum + t.width, 0) + Math.max(0, line.length - 1) * spaceW;
-              let cursorX = baseCenterX - lineW / 2;
-              const y = startY + lIdx * lineHeight;
-              ctx.textAlign = 'left';
-              for (const tok of line) {
-                ctx.fillStyle = tok.isHighlighted ? highlightCol : primaryCol;
-                if ((style.outlineWidth ?? 2) > 0) {
-                  ctx.strokeText(tok.text, cursorX, y);
-                }
-                ctx.fillText(tok.text, cursorX, y);
-                cursorX += tok.width + spaceW;
-              }
-            });
-          } else {
-            const fallbackRaw = activeCaption.translatedText || activeCaption.text;
-            const fallbackText = fallbackRaw ? applyTextTransform(fallbackRaw, style) : '';
-            if (fallbackText) {
-              ctx.textAlign = 'center';
-              ctx.fillStyle = primaryCol;
-              ctx.strokeText(fallbackText, baseCenterX, targetH * posYFrac, maxTextW);
-              ctx.fillText(fallbackText, baseCenterX, targetH * posYFrac, maxTextW);
-            }
-          }
-        }
+      // 5. Draw active synced captions via precomputed cache (zero per-frame text measurement)
+      if (captionCache) {
+        drawCachedCaptionsAtTime(ctx, captionCache, timelineTime, captionCursor);
       }
 
       animId = requestAnimationFrame(drawFrame);

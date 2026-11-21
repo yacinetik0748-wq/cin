@@ -906,7 +906,7 @@ export async function trimAndMergeDubClipsInBrowser(params: {
     const code = await ff.exec([
       '-i', 'dub_merge.wav',
       '-c:a', 'libmp3lame',
-      '-b:a', '192k',
+      '-b:a', '128k',
       'dub_merge.mp3',
     ]);
     const data = code === 0 ? ((await ff.readFile('dub_merge.mp3')) as Uint8Array) : null;
